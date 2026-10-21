@@ -141,6 +141,15 @@ wheels = [
 ]
 
 [[package]]
+name = "looptime"
+version = "0.9"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/23/e1/307c060c3ea3f9659f2937b29d21981fc2510c8bda8f361578489cc4bda5/looptime-0.9.tar.gz", hash = "sha256:3d9c8b3a5b539e63c596491e8fbd30c3c99990cf2e24c98cade08f54178524d4", size = 41305, upload-time = "2026-10-14T14:22:28.296Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/2f/a1f91a698965f187e13eac7ef9eb15ef83d69183434ce82e1981d59ec3a4/looptime-0.9-py3-none-any.whl", hash = "sha256:5cae7abe4572366d2914cc001fb39d4401b124373cb5ef8e06015dcf241afb9a", size = 21812, upload-time = "2026-10-14T14:22:26.784Z" },
+]
+
+[[package]]
 name = "markupsafe"
 version = "3.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -486,6 +495,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "looptime" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -500,6 +510,7 @@ requires-dist = [{ name = "msgspec", specifier = ">=0.22.0" }]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "looptime", specifier = ">=0.9" },
     { name = "pytest", specifier = ">=9.1.1" },
     { name = "pytest-asyncio", specifier = ">=1.4.0" },
     { name = "pytest-cov", specifier = ">=7.1.0" },
