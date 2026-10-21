@@ -8,7 +8,15 @@ from datetime import timedelta
 
 from wicket.limits import Limit
 from wicket.priority import Priority
-from wicket.results import Conflict, Missing, NoTicket
+from wicket.results import (
+    Conflict,
+    LeaseLost,
+    LeaseLostError,
+    Missing,
+    NoTicket,
+    Renewed,
+    StoreUnavailable,
+)
 from wicket.store import Ledger
 from wicket.tickets import Permit, Waiting
 from wicket.view import PoolView
@@ -42,11 +50,28 @@ class Pool:
 
     @asynccontextmanager
     async def permit(self) -> AsyncGenerator[Permit, None]:
-        """Wait for a grant and lease the ticket to the block. Only a block that ends normally
-        releases it; otherwise it is delivered again once its lease ends."""
+        """Wait for a grant and lease the ticket to the block, renewing the lease while it runs.
+        Only a block that ends normally releases the ticket; an error, a cancellation or a lost
+        lease (LeaseLostError) leave it to be delivered again once its lease ends."""
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("permit() runs in an asyncio task")
         async with self._turn:
-            permit, _ = await self._granted()
-        yield permit
+            permit, since = await self._granted()
+        renewal = _Renewal(self._ledger, permit, self._lease, since, task)
+        keeper = asyncio.create_task(renewal.keep())
+        cancelling = task.cancelling()
+        try:
+            yield permit
+        except BaseException as error:
+            keeper.cancel()
+            if renewal.lost and task.uncancel() <= cancelling:  # only the renewal cancelled it
+                raise renewal.error from error
+            raise
+        keeper.cancel()
+        if renewal.lost:  # the body caught the cancellation and ended normally
+            task.uncancel()
+            raise renewal.error
         await self._ledger.release(permit)  # LeaseLost: re-leased or withdrawn since; nothing to do
 
     async def _granted(self) -> tuple[Permit, float]:
@@ -83,3 +108,59 @@ class Pool:
                             return conflict
                         case Missing():
                             view = view.without(chosen.ticket.id)  # withdrawn or held: the next one
+
+
+class _Renewal:
+    """Keeps a permit's lease while its block runs, and cancels the block once the lease is lost.
+    A plain class: it notes that the lease was lost, and the error the block leaves with."""
+
+    def __init__(
+        self, ledger: Ledger, permit: Permit, lease: timedelta, since: float, owner: asyncio.Task
+    ) -> None:
+        self._ledger = ledger
+        self._permit = permit
+        self._lease = lease
+        self._since = since  # event loop time from which the store's lease surely runs
+        self._owner = owner
+        self.lost = False
+        self.error: Exception = LeaseLostError(
+            f"the lease of ticket {permit.waiting.ticket.id!r} in pool {permit.pool!r} was lost; "
+            "it will be delivered again"
+        )
+
+    async def keep(self) -> None:
+        try:
+            await self._renewing()
+        except Exception as error:  # the adapter's bug: stop the block and let it propagate
+            self.error = error
+            self._lose()
+
+    async def _renewing(self) -> None:
+        loop, seconds = asyncio.get_running_loop(), self._lease.total_seconds()
+        while True:
+            await asyncio.sleep(seconds / 3)
+            while True:
+                tried, last_try = loop.time(), self._since + seconds - seconds / 30
+                try:
+                    async with asyncio.timeout_at(last_try):
+                        answer = await self._ledger.renew(self._permit, lease=self._lease)
+                except TimeoutError:  # a renewal that hangs until the lease is about to end
+                    self._lose()
+                    return
+                except StoreUnavailable:
+                    if loop.time() + seconds / 30 >= self._since + seconds:
+                        self._lose()
+                        return
+                    await asyncio.sleep(seconds / 30)
+                    continue
+                match answer:
+                    case Renewed():
+                        self._since = tried
+                        break
+                    case LeaseLost():
+                        self._lose()
+                        return
+
+    def _lose(self) -> None:
+        self.lost = True
+        self._owner.cancel()
