@@ -1,6 +1,7 @@
 """The decision as pure functions of a view: fairness between tenants, the factors, and the
 choice of the highest priority."""
 
+import math
 import random
 from datetime import UTC, datetime, timedelta
 
@@ -174,5 +175,8 @@ def test_nothing_waiting_is_no_ticket():
 def test_a_negative_weight_or_a_full_after_of_zero_is_refused():
     with pytest.raises(ValueError, match="weight"):
         Priority((FairShare(), -1))
+    for weight in (math.nan, math.inf):
+        with pytest.raises(ValueError, match="finite"):
+            Priority((FairShare(), weight))
     with pytest.raises(ValueError, match="full_after"):
         Age(full_after=timedelta(0))

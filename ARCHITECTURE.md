@@ -83,8 +83,8 @@ in all of `src/wicket/`.
   public fields; accessor methods would be noise in Python.
 - **A permit is held with `async with`**, Python's usual "take, use, give back".
 - **Three plain classes.** `Priority` takes its factors as arguments, which a `Struct` cannot, and
-  never changes. `Pool` holds the lock that orders the `permit()` calls of one process, and a
-  permit's renewal notes when its lease was lost.
+  never changes. `Pool` holds the lock that orders the `permit()` calls of one process, and its
+  private `_Renewal` notes when a permit's lease was lost.
 - **The in-memory store changes inside.** Its methods never await, so each runs whole in one event
   loop; its state leaves it only as views.
 

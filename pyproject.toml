@@ -56,6 +56,7 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 timeout = 30
+filterwarnings = ["ignore:There is no current event loop:DeprecationWarning:looptime"]
 
 [tool.ruff]
 line-length = 100

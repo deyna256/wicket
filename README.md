@@ -41,8 +41,8 @@ async with pool.permit() as permit:  # waits for a grant, renews the lease while
 - Limits hold across any number of processes: every grant is a compare-and-swap on the pool's version.
 - A worker that dies loses its lease, and the ticket is delivered again; a fencing token rejects the
   old worker's late write.
-- State lives behind two small ports, `Backlog` and `Ledger`, with an in-memory store and a
-  PostgreSQL one.
+- State lives behind two small ports, `Backlog` and `Ledger`, with an in-memory store (built)
+  and a PostgreSQL one (planned).
 
 ## Documentation
 

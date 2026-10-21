@@ -1,5 +1,6 @@
 """How important each waiting ticket is, and the choice of the most important."""
 
+import math
 from collections.abc import Mapping
 from datetime import timedelta
 from typing import Protocol
@@ -60,8 +61,10 @@ class Priority:
 
     def __init__(self, *factors: tuple[Factor, float]) -> None:
         for factor, weight in factors:
-            if weight < 0:
-                raise ValueError(f"the weight of {factor!r} is {weight}; weights are not negative")
+            if not 0 <= weight < math.inf:
+                raise ValueError(
+                    f"the weight of {factor!r} is {weight}; weights are finite and not negative"
+                )
         self._factors = factors
 
     def first(self, view: PoolView) -> Waiting | NoTicket:
