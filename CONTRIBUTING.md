@@ -115,7 +115,10 @@ to `main` and pushes to `main`. It fails when `uv.lock` is out of date.
   `PoolView`, on properties such as "two tenants alternate" and "no eleventh grant in a minute".
 - Every store passes `StoreContract`, the test suite of the `Backlog` and `Ledger` obligations. A new
   store joins it.
-- Time in tests is the in-memory store's clock, set by the test; nothing reads the wall clock.
+- Time in tests is the in-memory store's clock, set by the test; nothing reads the wall clock. A
+  test of waits — a poll, a lease, a renewal — is marked `looptime`, so the event loop's time goes
+  on at once over every wait, and its store's clock follows the loop's (`loop.time()`), so leases
+  and renewals share one time line.
 - Async tests need no marker (`asyncio_mode = "auto"`). A test that runs longer than 30 seconds fails
   (pytest-timeout).
 

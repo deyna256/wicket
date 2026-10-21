@@ -7,8 +7,9 @@ parties that submit it, and within limits on how much runs at once and how fast 
 not run the work, retry it or keep its status. It sits beside the queue you already have and tells
 your workers what to take next.
 
-> **Status:** designed, not built yet. Nothing below can be installed today; the decisions behind it
-> are in [docs/decisions](https://github.com/deyna256/wicket/tree/main/docs/decisions).
+> **Status:** the core and the in-memory store are built and unreleased; the PostgreSQL store is
+> next. The decisions behind the design are in
+> [docs/decisions](https://github.com/deyna256/wicket/tree/main/docs/decisions).
 
 ## The idea
 

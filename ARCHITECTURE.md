@@ -3,8 +3,7 @@
 This document is for people who change wicket's code. It describes how the code is laid out and the
 rules that hold everywhere in it. Why the main choices were made is in [docs/decisions](docs/decisions/).
 
-**Nothing is built yet.** The code map below is the planned layout; the invariants already hold for
-the first line of code.
+The core and the in-memory store are built; the PostgreSQL store is planned.
 
 ## Bird's eye view
 
@@ -24,17 +23,25 @@ The decision is a pure function of a `PoolView`; only the store does I/O.
 
 ## Code map
 
-Planned; all code will be in `src/wicket/`.
+All code is in `src/wicket/`.
 
-| part | what is there |
+| module | what is there |
 |---|---|
-| core | the values `Ticket`, `Waiting`, `Permit`, `PoolView`, `Version`, `Fairness` and the result values; the errors `LeaseLostError` and `StoreUnavailable`; the contracts `Factor`, `Limit`, `Backlog`, `Ledger`; `Priority`; `Pool` |
-| factors and limits | `FairShare`, `Age`, `Trait`; `Concurrency`, `Rate` |
-| in-memory store | `MemoryState`, and its two adapters `MemoryBacklog` and `MemoryLedger` |
-| `StoreContract` | the test suite every pair of store adapters passes |
-| `postgres` extra | `PostgresBacklog` on the caller's session and `PostgresLedger` on its own engine |
+| `results.py` | the result values `Withdrawn`, `AlreadyLeased`, `Gone`, `Conflict`, `Missing`, `Renewed`, `Released`, `LeaseLost`, `NoTicket`; the errors `LeaseLostError` and `StoreUnavailable` |
+| `tickets.py` | `Version`, `Ticket`, which checks its traits, `Waiting`, `Permit` |
+| `fairness.py` | `Fairness`, Start-time Fair Queuing with every ticket weighing one |
+| `view.py` | `PoolView`, the snapshot every decision reads |
+| `priority.py` | the contract `Factor`; `FairShare`, `Age`, `Trait`; `Priority` |
+| `limits.py` | the contract `Limit`; `Concurrency`, `Rate` |
+| `store.py` | the ports `Backlog` and `Ledger` |
+| `memory.py` | the in-memory store: `MemoryState` and its two adapters `MemoryBacklog` and `MemoryLedger` |
+| `pool.py` | `Pool`, which waits for grants and keeps a permit's lease while its block runs |
 
-The public API will be `wicket.__all__`. Everything else may change without notice.
+`tests/test_store_contract.py` is `StoreContract`, the suite every pair of store adapters passes.
+The `postgres` extra, `PostgresBacklog` on the caller's session and `PostgresLedger` on its own
+engine, is planned.
+
+The public API is `wicket.__all__`. Everything else may change without notice.
 
 ## Invariants
 
@@ -75,8 +82,11 @@ in all of `src/wicket/`.
 - **Data has public fields.** `Ticket`, `Waiting`, `Permit` and `PoolView` are immutable records with
   public fields; accessor methods would be noise in Python.
 - **A permit is held with `async with`**, Python's usual "take, use, give back".
-- **Two kinds of objects change inside:** the in-memory store, behind its lock, whose state never
-  leaves it except as views; and `Pool`'s lock, which orders the `permit()` calls of one process.
+- **Three plain classes.** `Priority` takes its factors as arguments, which a `Struct` cannot, and
+  never changes. `Pool` holds the lock that orders the `permit()` calls of one process, and a
+  permit's renewal notes when its lease was lost.
+- **The in-memory store changes inside.** Its methods never await, so each runs whole in one event
+  loop; its state leaves it only as views.
 
 ## Cross-cutting concerns
 
