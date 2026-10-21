@@ -65,15 +65,18 @@ class Pool:
             yield permit
         except BaseException as error:
             keeper.cancel()
+            only_ours = renewal.lost and task.uncancel() <= cancelling  # before any await
             await asyncio.wait([keeper])
-            if renewal.lost and task.uncancel() <= cancelling:  # only the renewal cancelled it
+            if only_ours:  # only the renewal cancelled it
                 raise renewal.error from error
             raise
         keeper.cancel()
+        lost = renewal.lost  # the body caught the cancellation and ended normally
+        outside = lost and task.uncancel() > cancelling  # it swallowed one from outside as well
         await asyncio.wait([keeper])
-        if renewal.lost:  # the body caught the cancellation and ended normally
-            if task.uncancel() > cancelling:  # it swallowed one from outside as well
-                raise asyncio.CancelledError
+        if outside:
+            raise asyncio.CancelledError
+        if lost:
             raise renewal.error
         await self._ledger.release(permit)  # LeaseLost: re-leased or withdrawn since; nothing to do
 

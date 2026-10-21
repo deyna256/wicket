@@ -1,5 +1,7 @@
 """Fairness between tenants: Start-time Fair Queuing with every ticket weighing one."""
 
+from collections.abc import Iterable, Mapping
+
 import msgspec
 
 from wicket.tickets import Waiting
@@ -14,7 +16,13 @@ class Fairness(msgspec.Struct, frozen=True):
     tags: tuple[tuple[str, int], ...] = ()
 
     def start(self, tenant: str) -> int:
-        return max(self.v, dict(self.tags).get(tenant, self.v))
+        """The tenant's start, max(v, its finish tag)."""
+        return self.starts([tenant])[tenant]
+
+    def starts(self, tenants: Iterable[str]) -> Mapping[str, int]:
+        """Each tenant's start, max(v, its finish tag)."""
+        tags = dict(self.tags)
+        return {t: max(self.v, tags.get(t, self.v)) for t in tenants}
 
     def after(self, waiting: Waiting) -> "Fairness":
         """The state after granting this ticket; a redelivery leaves it as it is."""

@@ -89,6 +89,16 @@ def test_virtual_time_never_falls_and_no_tag_stays_at_or_below_it():
         last = fairness.v
 
 
+def test_starts_equals_start_for_every_tenant():
+    rng = random.Random(3)
+    fairness, tenants = Fairness(), "abcdefgh"
+    for n in range(300):
+        fairness = fairness.after(ticket(str(n), rng.choice(tenants)))
+        assert fairness.starts([*tenants, "new"]) == {
+            t: fairness.start(t) for t in [*tenants, "new"]
+        }
+
+
 def test_within_a_tenant_the_oldest_goes_first():
     view = PoolView(
         now=EPOCH + HOUR, retention=HOUR, waiting=(ticket("new", "a", 5), ticket("old", "a", 1))

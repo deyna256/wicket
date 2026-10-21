@@ -481,6 +481,27 @@ async def test_a_cancellation_from_outside_wins_even_when_the_body_swallows_both
         await scripted.worker
 
 
+@pytest.mark.parametrize("swallow", [False, True])
+async def test_a_cancellation_landing_while_the_renewal_stops_is_counted_once(swallow: bool):
+    _, ledger = await submitted()
+
+    async def worker() -> None:
+        async with pool(Scripted(ledger, renews=[LeaseLost()])).permit():
+            try:
+                await asyncio.sleep(1000)
+            except asyncio.CancelledError:
+                task = asyncio.current_task()
+                assert task is not None
+                asyncio.get_running_loop().call_soon(task.cancel)  # from outside, on the next tick
+                if not swallow:
+                    raise
+
+    task = asyncio.create_task(worker())
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert task.cancelling() == 1
+
+
 async def test_a_timeout_of_the_ledger_itself_is_its_error_not_a_lost_lease():
     _, ledger = await submitted()
     with pytest.raises(TimeoutError, match="socket"):
