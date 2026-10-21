@@ -372,6 +372,40 @@ class Unreachable(Scripted):
         return await super().view(pool)
 
 
+class CancelledFromOutside(Scripted):
+    """A ledger whose first renewal finds the worker cancelled from outside, then answers that the
+    lease is lost."""
+
+    def __init__(self, ledger: MemoryLedger) -> None:
+        super().__init__(ledger)
+        self.worker: asyncio.Task | None = None
+
+    async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost:
+        assert self.worker is not None
+        self.worker.cancel()
+        return LeaseLost()
+
+
+class SlowRenewals(Scripted):
+    """A ledger whose renewals take 5 s; it logs when they start and stop, and releases."""
+
+    def __init__(self, ledger: MemoryLedger) -> None:
+        super().__init__(ledger)
+        self.log: list[str] = []
+
+    async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost:
+        self.log.append("renew")
+        try:
+            await asyncio.sleep(5)
+            return await self.ledger.renew(permit, lease=lease)
+        finally:
+            self.log.append("renew stopped")
+
+    async def release(self, permit: Permit) -> Released | LeaseLost:
+        self.log.append("release")
+        return await self.ledger.release(permit)
+
+
 async def test_a_renewal_that_hangs_cancels_the_block_before_the_lease_ends():
     _, ledger = await submitted()
     start = now()
@@ -422,10 +456,45 @@ async def test_a_lost_lease_leaves_the_task_uncancelled():
 
 async def test_a_cancellation_from_outside_wins_over_a_lost_lease():
     _, ledger = await submitted()
-    with pytest.raises(TimeoutError):
-        async with asyncio.timeout(LEASE.total_seconds() / 3):  # fires with the first renewal
-            async with pool(Scripted(ledger, renews=[LeaseLost()])).permit():
+    scripted = CancelledFromOutside(ledger)
+
+    async def worker() -> None:
+        async with pool(scripted).permit():
+            await asyncio.sleep(1000)
+
+    scripted.worker = asyncio.create_task(worker())
+    with pytest.raises(asyncio.CancelledError):
+        await scripted.worker
+
+
+async def test_a_cancellation_from_outside_wins_even_when_the_body_swallows_both():
+    _, ledger = await submitted()
+    scripted = CancelledFromOutside(ledger)
+
+    async def worker() -> None:
+        async with pool(scripted).permit():
+            with contextlib.suppress(asyncio.CancelledError):
                 await asyncio.sleep(1000)
+
+    scripted.worker = asyncio.create_task(worker())
+    with pytest.raises(asyncio.CancelledError):
+        await scripted.worker
+
+
+async def test_a_timeout_of_the_ledger_itself_is_its_error_not_a_lost_lease():
+    _, ledger = await submitted()
+    with pytest.raises(TimeoutError, match="socket"):
+        async with pool(Scripted(ledger, renews=[TimeoutError("socket")])).permit():
+            await asyncio.sleep(1000)
+    assert await attempt_of_next_grant(ledger) == 2
+
+
+async def test_the_release_waits_for_a_renewal_in_flight_to_stop():
+    _, ledger = await submitted()
+    slow = SlowRenewals(ledger)
+    async with pool(slow).permit():
+        await asyncio.sleep(12)  # the first renewal starts at 10 s and is still running
+    assert slow.log == ["renew", "renew stopped", "release"]
 
 
 async def test_workers_of_several_processes_never_exceed_the_limit():

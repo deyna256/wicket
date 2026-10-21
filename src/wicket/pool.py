@@ -65,12 +65,15 @@ class Pool:
             yield permit
         except BaseException as error:
             keeper.cancel()
+            await asyncio.wait([keeper])
             if renewal.lost and task.uncancel() <= cancelling:  # only the renewal cancelled it
                 raise renewal.error from error
             raise
         keeper.cancel()
+        await asyncio.wait([keeper])
         if renewal.lost:  # the body caught the cancellation and ended normally
-            task.uncancel()
+            if task.uncancel() > cancelling:  # it swallowed one from outside as well
+                raise asyncio.CancelledError
             raise renewal.error
         await self._ledger.release(permit)  # LeaseLost: re-leased or withdrawn since; nothing to do
 
@@ -141,11 +144,14 @@ class _Renewal:
             await asyncio.sleep(seconds / 3)
             while True:
                 tried, last_try = loop.time(), self._since + seconds - seconds / 30
+                deadline = asyncio.timeout_at(last_try)
                 try:
-                    async with asyncio.timeout_at(last_try):
+                    async with deadline:
                         answer = await self._ledger.renew(self._permit, lease=self._lease)
-                except TimeoutError:  # a renewal that hangs until the lease is about to end
-                    self._lose()
+                except TimeoutError:
+                    if not deadline.expired():
+                        raise  # the ledger's own timeout: its bug, keep() carries it on
+                    self._lose()  # a renewal that hangs until the lease is about to end
                     return
                 except StoreUnavailable:
                     if loop.time() + seconds / 30 >= self._since + seconds:
