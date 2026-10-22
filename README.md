@@ -59,7 +59,14 @@ import asyncio
 from datetime import timedelta
 
 from wicket import (
-    Concurrency, FairShare, MemoryBacklog, MemoryLedger, MemoryState, Pool, Priority, Ticket,
+    Concurrency,
+    FairShare,
+    MemoryBacklog,
+    MemoryLedger,
+    MemoryState,
+    Pool,
+    Priority,
+    Ticket,
 )
 
 
