@@ -49,12 +49,16 @@ async with pool.permit() as permit:  # waits for a grant, renews the lease while
 `pip install "wicket[postgres]"` brings SQLAlchemy; bring your driver (asyncpg or psycopg).
 
 ```python
+from datetime import timedelta
+
+from wicket import Ticket
 from wicket.postgres import PostgresBacklog, PostgresLedger, metadata
 
 # in your Alembic env.py: target_metadata = [your_metadata, metadata]
 
 async with session.begin():  # your transaction: the row and its ticket commit together
     session.add(row)
+    await session.flush()  # the row gets its id
     await PostgresBacklog(session).submit("materials", Ticket(id=str(row.id), tenant=str(user_id)))
 
 ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retention in every process

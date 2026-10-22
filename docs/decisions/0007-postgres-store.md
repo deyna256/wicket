@@ -5,16 +5,17 @@
 ## Context
 
 A service whose workers run in several processes needs one queue they all see, tickets that
-survive a restart, and a ticket written in the same transaction as the caller's own row
-(obligation 8). The caller owns that transaction; wicket must only be able to write inside it,
-which needs it to speak the caller's database layer. For Python services that is usually
-SQLAlchemy.
+survive a restart, and a ticket written in the same transaction as the caller's own row, so that
+the two commit together or not at all. The caller owns that transaction; wicket must only be able
+to write inside it, which needs it to speak the caller's database layer. For Python services that
+is usually SQLAlchemy.
 
 ## Decision
 
 - **SQLAlchemy's asyncio Core**, in the extra `wicket[postgres]` (`sqlalchemy[asyncio]>=2.1.6`, the
-  first release with every asyncio cancellation fix up to #13699). The core keeps msgspec as its
-  only dependency ([decision 6](0006-dependencies.md)).
+  first release with every asyncio cancellation fix up to
+  [SQLAlchemy issue #13699](https://github.com/sqlalchemy/sqlalchemy/issues/13699)). The core keeps
+  msgspec as its only dependency ([decision 6](0006-dependencies.md)).
 - **`PostgresBacklog(session)`** works on the caller's `AsyncSession` and never commits.
   **`PostgresLedger(engine, retention)`** runs each call in a short transaction of its own on a
   connection from the engine. The driver is the caller's, through its URL: asyncpg or psycopg.
