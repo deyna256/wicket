@@ -1,6 +1,9 @@
 <div align="center">
 
-<h1>wicket</h1>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deyna256/wicket/main/docs/assets/mark-dark.svg">
+  <img alt="wicket" src="https://raw.githubusercontent.com/deyna256/wicket/main/docs/assets/mark-light.svg" height="72">
+</picture>
 
 <h3>Which waiting job may start now?</h3>
 
@@ -17,6 +20,10 @@ priority, fairness between tenants, and limits that hold across every process.</
 [Changelog](https://github.com/deyna256/wicket/blob/main/CHANGELOG.md)
 
 </div>
+
+<p align="center">
+  <img alt="alice asks for 6 reports, bob for 2, carol for 1. In a plain queue carol starts last, 9th; with wicket she starts 3rd" src="https://raw.githubusercontent.com/deyna256/wicket/main/docs/assets/demo.svg" width="720">
+</p>
 
 ## Why wicket
 
