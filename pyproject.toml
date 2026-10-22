@@ -63,6 +63,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+strict = true
 testpaths = ["tests"]
 timeout = 30
 markers = ["postgres: the test needs the PostgreSQL test database (see tests/conftest.py)"]
