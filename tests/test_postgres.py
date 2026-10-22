@@ -105,15 +105,19 @@ async def grant_first(
 
 async def terminate_every_session(url: URL) -> None:
     """What a server restart does to the pooled connections."""
+    others = "from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"
     admin = create_async_engine(url, isolation_level="AUTOCOMMIT")
-    async with admin.connect() as connection:
-        await connection.execute(
-            text(
-                "select pg_terminate_backend(pid) from pg_stat_activity "
-                "where datname = current_database() and pid <> pg_backend_pid()"
-            )
-        )
-    await admin.dispose()
+    try:
+        async with admin.connect() as connection:
+            await connection.execute(text(f"select pg_terminate_backend(pid) {others}"))
+            for _ in range(50):  # until the backends are surely gone
+                left = (await connection.execute(text(f"select count(*) {others}"))).scalar_one()
+                if left == 0:
+                    return
+                await asyncio.sleep(0.02)
+            raise AssertionError(f"{left} backends are still there after being terminated")
+    finally:
+        await admin.dispose()
 
 
 async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(engine: AsyncEngine):
@@ -147,9 +151,6 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
 ):
     await submit(engine, "1", "2")
     ledger = PostgresLedger(engine, HOUR)
-    rival_engine = create_async_engine(url)
-    rival = PostgresLedger(rival_engine, HOUR)
-    first = await ledger.view("p")
     fired: list[bool] = []
 
     def grant_in_between(connection: Any, cursor: Any, statement: str, *args: Any) -> None:
@@ -167,11 +168,15 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
             )
             assert isinstance(granted, Permit)
 
-    event.listen(engine.sync_engine, "before_cursor_execute", grant_in_between)
     try:
+        rival_engine = create_async_engine(url)
+        rival = PostgresLedger(rival_engine, HOUR)
+        first = await ledger.view("p")
+        event.listen(engine.sync_engine, "before_cursor_execute", grant_in_between)
         view = await ledger.view("p")
     finally:
-        event.remove(engine.sync_engine, "before_cursor_execute", grant_in_between)
+        if event.contains(engine.sync_engine, "before_cursor_execute", grant_in_between):
+            event.remove(engine.sync_engine, "before_cursor_execute", grant_in_between)
         await rival_engine.dispose()
     assert fired and (view.version, view.leased, view.grant_times) == (first.version, (), ())
     assert Concurrency(1).admits(view)  # the stale view admits, and its grant must lose
@@ -188,9 +193,9 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
 async def test_a_grant_that_waited_on_the_pool_is_a_conflict_whatever_the_engine(
     url: URL, level: str, pool_known: bool
 ):
-    rival_engine = create_async_engine(url)
     async with engine_at(url, isolation_level=level) as engine:
         try:
+            rival_engine = create_async_engine(url)
             await submit(engine, "0", "1", "2")
             ours, rival = PostgresLedger(engine, HOUR), PostgresLedger(rival_engine, HOUR)
             if pool_known:
@@ -375,10 +380,13 @@ async def test_a_missing_table_is_an_error_not_an_unavailable_store(url: URL):
 
 
 @pytest.mark.parametrize("retention", [timedelta(0), timedelta(seconds=-1)])
-def test_the_ledger_refuses_a_retention_that_is_not_positive(retention: timedelta):
+async def test_the_ledger_refuses_a_retention_that_is_not_positive(retention: timedelta):
     engine = create_async_engine("postgresql+asyncpg://nobody@127.0.0.1:1/none")
-    with pytest.raises(ValueError, match="retention"):
-        PostgresLedger(engine, retention)
+    try:
+        with pytest.raises(ValueError, match="retention"):
+            PostgresLedger(engine, retention)
+    finally:
+        await engine.dispose()
 
 
 async def test_a_submit_the_caller_rolls_back_leaves_no_ticket(engine: AsyncEngine):
@@ -402,12 +410,14 @@ def test_metadata_holds_the_three_tables_and_they_create_cleanly(database: URL):
     names = {"wicket_pools", "wicket_tickets", "wicket_grants"}
     assert set(metadata.tables) == names
     engine = create_engine(database)
-    with engine.begin() as connection:
-        connection.execute(text("create schema fresh; set local search_path = fresh"))
-        metadata.create_all(connection)
-        assert set(inspect(connection).get_table_names(schema="fresh")) == names
-        connection.execute(text("drop schema fresh cascade"))
-    engine.dispose()
+    try:
+        with engine.begin() as connection:
+            connection.execute(text("create schema fresh; set local search_path = fresh"))
+            metadata.create_all(connection)
+            assert set(inspect(connection).get_table_names(schema="fresh")) == names
+            connection.execute(text("drop schema fresh cascade"))
+    finally:
+        engine.dispose()
 
 
 async def test_a_connection_lost_as_a_view_closes_is_unavailable_then_the_next_call_works(
@@ -420,7 +430,6 @@ async def test_a_connection_lost_as_a_view_closes_is_unavailable_then_the_next_c
         if "FROM wicket_grants" in statement and not lost:  # the view's last statement
             lost.append(True)
             await_only(terminate_every_session(url))
-            await_only(asyncio.sleep(0.2))  # the server ends the backend before the view closes
 
     event.listen(engine.sync_engine, "after_cursor_execute", lose_the_connection)
     try:

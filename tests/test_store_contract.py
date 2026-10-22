@@ -94,8 +94,10 @@ class PostgresPair:
 
     async def stop(self) -> None:
         pool = self.engine.pool
-        assert isinstance(pool, QueuePool) and pool.checkedout() == 0  # all given back
-        await self.engine.dispose()
+        try:
+            assert isinstance(pool, QueuePool) and pool.checkedout() == 0  # all given back
+        finally:
+            await self.engine.dispose()
 
     async def elapse(self, time: timedelta) -> None:
         async with self.engine.begin() as connection:
@@ -129,8 +131,10 @@ async def store(request: pytest.FixtureRequest) -> AsyncGenerator[Pair, None]:
     driver = request.param.removeprefix("postgres-")
     pair = PostgresPair(database.set(drivername=f"postgresql+{driver}"))
     await pair.start()
-    yield pair
-    await pair.stop()
+    try:
+        yield pair
+    finally:
+        await pair.stop()
 
 
 async def granted(store: Pair, ticket_id: str, pool: str = "p", lease: timedelta = LEASE) -> Permit:
