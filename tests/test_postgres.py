@@ -408,3 +408,25 @@ def test_metadata_holds_the_three_tables_and_they_create_cleanly(database: URL):
         assert set(inspect(connection).get_table_names(schema="fresh")) == names
         connection.execute(text("drop schema fresh cascade"))
     engine.dispose()
+
+
+async def test_a_connection_lost_as_a_view_closes_is_unavailable_then_the_next_call_works(
+    engine: AsyncEngine, url: URL
+):
+    ledger = PostgresLedger(engine, HOUR)
+    lost: list[bool] = []
+
+    def lose_the_connection(connection: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if "FROM wicket_grants" in statement and not lost:  # the view's last statement
+            lost.append(True)
+            await_only(terminate_every_session(url))
+            await_only(asyncio.sleep(0.2))  # the server ends the backend before the view closes
+
+    event.listen(engine.sync_engine, "after_cursor_execute", lose_the_connection)
+    try:
+        with pytest.raises(StoreUnavailable):
+            await ledger.view("p")
+    finally:
+        event.remove(engine.sync_engine, "after_cursor_execute", lose_the_connection)
+    assert lost
+    await ledger.view("p")

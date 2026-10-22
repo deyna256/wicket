@@ -292,7 +292,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
     @contextlib.asynccontextmanager
     async def _connection(self, options: dict[str, Any]) -> AsyncGenerator[AsyncConnection, None]:
         """A connection at the isolation this call needs, whatever the engine's own."""
-        async with contextlib.AsyncExitStack() as stack, _Reach().executing():
+        async with _Reach().executing(), contextlib.AsyncExitStack() as stack:
             connection = await _Reach().connect(stack.enter_async_context(self.engine.connect()))
             yield await connection.execution_options(**options)
 
