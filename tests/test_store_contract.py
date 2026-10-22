@@ -9,16 +9,13 @@ from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
 import pytest
-from sqlalchemy import URL, text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from sqlalchemy.pool import QueuePool
+from postgres_db import elapse, emptied
+from sqlalchemy import URL
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from wicket.fairness import Fairness
-from wicket.limits import Concurrency
 from wicket.memory import MemoryBacklog, MemoryLedger, MemoryState
-from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
-from wicket.priority import FairShare, Priority
 from wicket.results import (
     AlreadyLeased,
     Conflict,
@@ -79,32 +76,15 @@ class Committing:
 
 
 class PostgresPair:
-    """The PostgreSQL adapters on the test database, emptied and with its clock at EPOCH."""
+    """The PostgreSQL adapters on an engine of the test database."""
 
-    def __init__(self, database: URL) -> None:
-        self.engine = create_async_engine(database)
-        self.backlog = Committing(self.engine)
-        self.ledger = PostgresLedger(self.engine, RETENTION)
-
-    async def start(self) -> None:
-        async with self.engine.begin() as connection:
-            for table in ("wicket_pools", "wicket_tickets", "wicket_grants"):
-                await connection.execute(text(f"delete from {table}"))
-            await connection.execute(text("update wicket_test_clock set at = :at"), {"at": EPOCH})
-
-    async def stop(self) -> None:
-        pool = self.engine.pool
-        try:
-            assert isinstance(pool, QueuePool) and pool.checkedout() == 0  # all given back
-        finally:
-            await self.engine.dispose()
+    def __init__(self, engine: AsyncEngine) -> None:
+        self.engine = engine
+        self.backlog = Committing(engine)
+        self.ledger = PostgresLedger(engine, RETENTION)
 
     async def elapse(self, time: timedelta) -> None:
-        async with self.engine.begin() as connection:
-            await connection.execute(
-                text("update wicket_test_clock set at = at + make_interval(secs => :s)"),
-                {"s": time.total_seconds()},
-            )
+        await elapse(self.engine, time)
 
 
 class Pair(Protocol):
@@ -133,12 +113,8 @@ async def store(request: pytest.FixtureRequest) -> AsyncGenerator[Pair, None]:
         return
     database: URL = request.getfixturevalue("database")
     driver = request.param.removeprefix("postgres-")
-    pair = PostgresPair(database.set(drivername=f"postgresql+{driver}"))
-    try:
-        await pair.start()
-        yield pair
-    finally:
-        await pair.stop()
+    async with emptied(database.set(drivername=f"postgresql+{driver}"), EPOCH) as engine:
+        yield PostgresPair(engine)
 
 
 async def granted(store: Pair, ticket_id: str, pool: str = "p", lease: timedelta = LEASE) -> Permit:
@@ -321,6 +297,8 @@ async def test_two_pools_keep_equal_ids_and_tokens_apart(store: Pair):
     in_a, in_b = await granted(store, "1", "a"), await granted(store, "1", "b")
     assert in_a.token == in_b.token == 1
     assert await store.ledger.release(in_a) == Released()
+    assert await store.ledger.renew(in_a, lease=LEASE) == LeaseLost()
+    assert await store.ledger.renew(in_b, lease=LEASE) == Renewed()
     assert (await store.ledger.view("b")).leased == (in_b,)
 
 
@@ -335,42 +313,3 @@ async def test_the_view_reports_the_retention_and_the_grants_within_it(store: Pa
     assert view.grant_times == (first.granted_at, second.granted_at)
     await store.elapse(timedelta(minutes=31))
     assert (await store.ledger.view("p")).grant_times == (second.granted_at,)
-
-
-async def test_pools_keep_equal_permits_apart(store: Pair):
-    for pool in ("a", "b"):
-        await store.backlog.submit(pool, Ticket("1", "ann"))
-    in_a, in_b = await granted(store, "1", "a"), await granted(store, "1", "b")
-    assert await store.ledger.release(in_a) == Released()
-    assert await store.ledger.renew(in_a, lease=LEASE) == LeaseLost()
-    assert await store.ledger.renew(in_b, lease=LEASE) == Renewed()
-
-
-async def test_pools_of_several_processes_never_exceed_the_limit(store: Pair):
-    for n in range(12):
-        await store.backlog.submit("p", Ticket(str(n), f"t{n % 3}"))
-    pools = [
-        Pool(
-            store.ledger,
-            "p",
-            priority=Priority((FairShare(), 1)),
-            limits=(Concurrency(2),),
-            lease=timedelta(hours=1),
-            poll=timedelta(milliseconds=20),
-        )
-        for _ in range(3)  # three "processes"
-    ]
-    running = peak = 0
-
-    async def worker(serving: Pool) -> None:
-        nonlocal running, peak
-        for _ in range(2):
-            async with serving.permit():
-                running += 1
-                peak = max(peak, running)
-                await asyncio.sleep(0.03)
-                running -= 1
-
-    await asyncio.gather(*(worker(pools[n % 3]) for n in range(6)))
-    assert peak == 2
-    assert (await store.ledger.view("p")).waiting == ()

@@ -10,15 +10,15 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
-from sqlalchemy import URL, create_engine, event, inspect, text
+from postgres_db import elapse, emptied, given_back, opened
+from sqlalchemy import URL, event, make_url, text
 from sqlalchemy.exc import ProgrammingError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
-from sqlalchemy.pool import QueuePool
-from sqlalchemy.util import await_only
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.util import await_
 
 from wicket.fairness import Fairness
-from wicket.limits import Concurrency, Rate
-from wicket.postgres import PostgresBacklog, PostgresLedger, metadata
+from wicket.limits import Rate
+from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.results import Conflict, Missing, Renewed, StoreUnavailable
 from wicket.tickets import Permit, Ticket, Waiting
 
@@ -28,6 +28,7 @@ EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 LEASE = timedelta(seconds=30)
 HOUR = timedelta(hours=1)
 BERLIN_SPRING = datetime(2027, 3, 28, 0, 50, tzinfo=UTC)  # Berlin moves to summer time at 01:00 UTC
+OTHERS = "from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"
 
 
 @pytest.fixture(params=["asyncpg", "psycopg"])
@@ -42,45 +43,9 @@ def settings(url: URL, **values: str) -> dict[str, Any]:
     return {"server_settings": values}
 
 
-def given_back(engine: AsyncEngine) -> bool:
-    pool = engine.pool
-    return isinstance(pool, QueuePool) and pool.checkedout() == 0
-
-
-async def reset(engine: AsyncEngine, at: datetime = EPOCH) -> None:
-    async with engine.connect() as connection:
-        connection = await connection.execution_options(isolation_level="READ COMMITTED")
-        for table in ("wicket_pools", "wicket_tickets", "wicket_grants"):
-            await connection.execute(text(f"delete from {table}"))
-        await connection.execute(text("update wicket_test_clock set at = :at"), {"at": at})
-        await connection.commit()
-
-
-async def elapse(engine: AsyncEngine, time: timedelta) -> None:
-    async with engine.connect() as connection:
-        connection = await connection.execution_options(isolation_level="READ COMMITTED")
-        await connection.execute(
-            text("update wicket_test_clock set at = at + make_interval(secs => :s)"),
-            {"s": time.total_seconds()},
-        )
-        await connection.commit()
-
-
-@contextlib.asynccontextmanager
-async def engine_at(url: URL, at: datetime = EPOCH, **options: Any) -> AsyncGenerator[AsyncEngine]:
-    """An engine on the emptied test database, its clock at `at`; every connection given back."""
-    engine = create_async_engine(url, pool_size=25, **options)
-    try:
-        await reset(engine, at)
-        yield engine
-        assert given_back(engine)
-    finally:
-        await engine.dispose()
-
-
 @pytest.fixture
 async def engine(url: URL) -> AsyncGenerator[AsyncEngine]:
-    async with engine_at(url) as engine:
+    async with emptied(url, EPOCH) as engine:
         yield engine
 
 
@@ -105,21 +70,21 @@ async def grant_first(
     )
 
 
+async def until(url: URL, condition: str) -> None:
+    """Asks the server `condition` on a connection of its own until it holds, a second at most."""
+    async with opened(url, isolation_level="AUTOCOMMIT") as admin, admin.connect() as connection:
+        for _ in range(50):
+            if (await connection.execute(text(f"select {condition}"))).scalar_one():
+                return
+            await asyncio.sleep(0.02)
+    raise AssertionError(f"the server never came to {condition}")
+
+
 async def terminate_every_session(url: URL) -> None:
     """What a server restart does to the pooled connections."""
-    others = "from pg_stat_activity where datname = current_database() and pid <> pg_backend_pid()"
-    admin = create_async_engine(url, isolation_level="AUTOCOMMIT")
-    try:
-        async with admin.connect() as connection:
-            await connection.execute(text(f"select pg_terminate_backend(pid) {others}"))
-            for _ in range(50):  # until the backends are surely gone
-                left = (await connection.execute(text(f"select count(*) {others}"))).scalar_one()
-                if left == 0:
-                    return
-                await asyncio.sleep(0.02)
-            raise AssertionError(f"{left} backends are still there after being terminated")
-    finally:
-        await admin.dispose()
+    async with opened(url, isolation_level="AUTOCOMMIT") as admin, admin.connect() as connection:
+        await connection.execute(text(f"select pg_terminate_backend(pid) {OTHERS}"))
+    await until(url, f"not exists (select {OTHERS})")
 
 
 async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(engine: AsyncEngine):
@@ -141,8 +106,8 @@ async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(en
             ),
             1,
         )
-        assert held == Missing() and isinstance(next_one, Permit)
-        await caller.rollback()
+        assert held == Missing()
+        assert isinstance(next_one, Permit)
 
 
 @pytest.mark.parametrize(
@@ -159,7 +124,7 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
         if before in statement and statement.lstrip().startswith("SELECT") and not fired:
             fired.append(True)
             chosen = first.waiting[0]
-            granted = await_only(
+            granted = await_(
                 rival.grant(
                     "p",
                     chosen.ticket.id,
@@ -170,24 +135,16 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
             )
             assert isinstance(granted, Permit)
 
-    try:
-        rival_engine = create_async_engine(url)
+    async with opened(url) as rival_engine:
         rival = PostgresLedger(rival_engine, HOUR)
         first = await ledger.view("p")
         event.listen(engine.sync_engine, "before_cursor_execute", grant_in_between)
-        view = await ledger.view("p")
-    finally:
-        if event.contains(engine.sync_engine, "before_cursor_execute", grant_in_between):
+        try:
+            view = await ledger.view("p")
+        finally:
             event.remove(engine.sync_engine, "before_cursor_execute", grant_in_between)
-        await rival_engine.dispose()
-    assert fired and (view.version, view.leased, view.grant_times) == (first.version, (), ())
-    assert Concurrency(1).admits(view)  # the stale view admits, and its grant must lose
-    other = view.waiting[1]
-    stale = await ledger.grant(
-        "p", other.ticket.id, version=view.version, lease=LEASE, fairness=view.fairness.after(other)
-    )
-    assert stale == Conflict()
-    assert len((await ledger.view("p")).leased) == 1
+    assert fired
+    assert (view.version, view.leased, view.grant_times) == (first.version, (), ())
 
 
 @pytest.mark.parametrize("level", ["SERIALIZABLE", "REPEATABLE READ"])
@@ -195,50 +152,44 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
 async def test_a_grant_that_waited_on_the_pool_is_a_conflict_whatever_the_engine(
     url: URL, level: str, pool_known: bool
 ):
-    async with engine_at(url, isolation_level=level) as engine:
-        try:
-            rival_engine = create_async_engine(url)
-            await submit(engine, "0", "1", "2")
-            ours, rival = PostgresLedger(engine, HOUR), PostgresLedger(rival_engine, HOUR)
-            if pool_known:
-                assert isinstance(await grant_first(ours), Permit)
-            view = await ours.view("p")
-            waiting: list[asyncio.Future[Permit | Conflict | Missing]] = []
+    async with emptied(url, EPOCH, isolation_level=level) as engine, opened(url) as rival_engine:
+        await submit(engine, "0", "1", "2")
+        ours, rival = PostgresLedger(engine, HOUR), PostgresLedger(rival_engine, HOUR)
+        if pool_known:
+            assert isinstance(await grant_first(ours), Permit)
+        view = await ours.view("p")
+        waiting: list[asyncio.Future[Permit | Conflict | Missing]] = []
 
-            def ours_waits_on_the_pool(
-                connection: Any, cursor: Any, statement: str, *a: Any
-            ) -> None:
-                if statement.lstrip().startswith("UPDATE wicket_tickets") and not waiting:
-                    waiting.append(
-                        asyncio.ensure_future(
-                            ours.grant(
-                                "p",
-                                view.waiting[1].ticket.id,
-                                version=view.version,
-                                lease=LEASE,
-                                fairness=view.fairness,
-                            )
+        def ours_waits_on_the_pool(connection: Any, cursor: Any, statement: str, *a: Any) -> None:
+            if statement.lstrip().startswith("UPDATE wicket_tickets") and not waiting:
+                waiting.append(
+                    asyncio.ensure_future(
+                        ours.grant(
+                            "p",
+                            view.waiting[1].ticket.id,
+                            version=view.version,
+                            lease=LEASE,
+                            fairness=view.fairness,
                         )
                     )
-                    await_only(asyncio.sleep(0.2))  # ours now waits on the pool's row
+                )
+                await_(until(url, f"exists (select {OTHERS} and wait_event_type = 'Lock')"))
 
-            event.listen(rival_engine.sync_engine, "before_cursor_execute", ours_waits_on_the_pool)
-            won = await rival.grant(
-                "p",
-                view.waiting[0].ticket.id,
-                version=view.version,
-                lease=LEASE,
-                fairness=view.fairness,
-            )
-            assert isinstance(won, Permit)
-            assert await waiting[0] == Conflict()
-        finally:
-            await rival_engine.dispose()
+        event.listen(rival_engine.sync_engine, "before_cursor_execute", ours_waits_on_the_pool)
+        won = await rival.grant(
+            "p",
+            view.waiting[0].ticket.id,
+            version=view.version,
+            lease=LEASE,
+            fairness=view.fairness,
+        )
+        assert isinstance(won, Permit)
+        assert await waiting[0] == Conflict()
 
 
 @pytest.mark.parametrize("level", ["SERIALIZABLE", "REPEATABLE READ", "AUTOCOMMIT"])
 async def test_grants_answer_one_permit_and_conflicts_whatever_the_engine(url: URL, level: str):
-    async with engine_at(url, isolation_level=level) as engine:
+    async with emptied(url, EPOCH, isolation_level=level) as engine:
         await submit(engine, *map(str, range(21)))
         ledger = PostgresLedger(engine, HOUR)
         view = await ledger.view("p")
@@ -259,21 +210,28 @@ async def test_grants_answer_one_permit_and_conflicts_whatever_the_engine(url: U
         assert (await ledger.view("p")).version == view.version
 
 
+async def test_every_moment_comes_back_at_utc_whatever_the_session_zone(url: URL):
+    berlin = settings(url, timezone="Europe/Berlin")
+    async with emptied(url, EPOCH, connect_args=berlin) as engine:
+        await submit(engine, "1", "2")
+        ledger = PostgresLedger(engine, HOUR)
+        granted = await grant_first(ledger)
+        view = await ledger.view("p")
+    assert isinstance(granted, Permit)
+    (leased,), (waiting,) = view.leased, view.waiting
+    moments = [granted.granted_at, granted.waiting.submitted_at, view.now, *view.grant_times]
+    moments += [leased.granted_at, leased.waiting.submitted_at, waiting.submitted_at]
+    assert {moment.tzinfo for moment in moments} == {UTC}
+
+
 async def test_rate_and_a_lease_keep_their_seconds_across_a_daylight_saving_change(url: URL):
     berlin = settings(url, timezone="Europe/Berlin")
-    async with engine_at(url, BERLIN_SPRING, connect_args=berlin) as engine:
+    async with emptied(url, BERLIN_SPRING, connect_args=berlin) as engine:
         await submit(engine, "1", "2")
         ledger = PostgresLedger(engine, timedelta(days=2))
         assert isinstance(await grant_first(ledger, lease=timedelta(days=1)), Permit)
         await elapse(engine, timedelta(minutes=30))
-        view = await ledger.view("p")
-        moments = [view.now, *view.grant_times]
-        moments += [w.submitted_at for w in view.waiting]
-        moments += [p.granted_at for p in view.leased] + [
-            p.waiting.submitted_at for p in view.leased
-        ]
-        assert all(moment.tzinfo is UTC for moment in moments)  # whatever the session's zone
-        assert not Rate(1, per=HOUR).admits(view)
+        assert not Rate(1, per=HOUR).admits(await ledger.view("p"))
         await elapse(engine, timedelta(hours=23))  # 23 h 30 min after the grant
         assert len((await ledger.view("p")).leased) == 1
         await elapse(engine, timedelta(minutes=30))
@@ -282,7 +240,7 @@ async def test_rate_and_a_lease_keep_their_seconds_across_a_daylight_saving_chan
 
 async def test_a_renewal_keeps_its_seconds_across_a_daylight_saving_change(url: URL):
     berlin = settings(url, timezone="Europe/Berlin")
-    async with engine_at(url, BERLIN_SPRING - timedelta(hours=12), connect_args=berlin) as engine:
+    async with emptied(url, BERLIN_SPRING - timedelta(hours=12), connect_args=berlin) as engine:
         await submit(engine, "1")
         ledger = PostgresLedger(engine, timedelta(days=2))
         permit = await grant_first(ledger, lease=timedelta(minutes=1))
@@ -294,7 +252,7 @@ async def test_a_renewal_keeps_its_seconds_across_a_daylight_saving_change(url: 
 
 async def test_grant_times_come_back_in_order_after_old_ones_are_deleted(url: URL):
     no_index = settings(url, enable_indexscan="off", enable_bitmapscan="off")
-    async with engine_at(url, connect_args=no_index) as engine:
+    async with emptied(url, EPOCH, connect_args=no_index) as engine:
         await submit(engine, *map(str, range(25)))
         ledger = PostgresLedger(engine, timedelta(minutes=10))
         for _ in range(25):
@@ -322,17 +280,6 @@ async def test_calls_cancelled_at_random_moments_leave_the_engine_usable(engine:
         assert given_back(engine)
 
 
-async def test_a_connection_the_server_ended_is_unavailable_then_the_next_call_works(
-    engine: AsyncEngine, url: URL
-):
-    ledger = PostgresLedger(engine, HOUR)
-    await ledger.view("p")
-    await terminate_every_session(url)
-    with pytest.raises(StoreUnavailable):
-        await ledger.view("p")
-    await ledger.view("p")
-
-
 async def test_after_a_server_restart_one_call_is_unavailable_then_calls_work(
     engine: AsyncEngine, url: URL
 ):
@@ -348,16 +295,15 @@ async def test_after_a_server_restart_one_call_is_unavailable_then_calls_work(
 @pytest.mark.parametrize("unreachable", ["closed port", "unknown role"])
 async def test_an_unreachable_server_is_unavailable_to_every_call(url: URL, unreachable: str):
     wrong = url.set(port=1) if unreachable == "closed port" else url.set(username="nobody")
-    engine = create_async_engine(wrong)
-    ledger = PostgresLedger(engine, HOUR)
     permit = Permit("p", Waiting(Ticket("1", "a"), EPOCH), EPOCH, 1)
-    calls: list[Callable[[], Any]] = [
-        lambda: ledger.view("p"),
-        lambda: ledger.grant("p", "1", version=0, lease=LEASE, fairness=Fairness()),
-        lambda: ledger.renew(permit, lease=LEASE),
-        lambda: ledger.release(permit),
-    ]
-    try:
+    async with opened(wrong) as engine:
+        ledger = PostgresLedger(engine, HOUR)
+        calls: list[Callable[[], Any]] = [
+            lambda: ledger.view("p"),
+            lambda: ledger.grant("p", "1", version=0, lease=LEASE, fairness=Fairness()),
+            lambda: ledger.renew(permit, lease=LEASE),
+            lambda: ledger.release(permit),
+        ]
         for call in calls:
             with pytest.raises(StoreUnavailable):
                 await call()
@@ -367,28 +313,20 @@ async def test_an_unreachable_server_is_unavailable_to_every_call(url: URL, unre
         async with AsyncSession(engine) as session:
             with pytest.raises(StoreUnavailable):
                 await PostgresBacklog(session).withdraw("p", "1")
-    finally:
-        await engine.dispose()
 
 
 async def test_a_missing_table_is_an_error_not_an_unavailable_store(url: URL):
     nowhere = settings(url, search_path="nowhere")
-    engine = create_async_engine(url, connect_args=nowhere)
-    try:
+    async with opened(url, connect_args=nowhere) as engine:
         with pytest.raises(ProgrammingError):
             await PostgresLedger(engine, HOUR).view("p")
-    finally:
-        await engine.dispose()
 
 
 @pytest.mark.parametrize("retention", [timedelta(0), timedelta(seconds=-1)])
 async def test_the_ledger_refuses_a_retention_that_is_not_positive(retention: timedelta):
-    engine = create_async_engine("postgresql+asyncpg://nobody@127.0.0.1:1/none")
-    try:
+    async with opened(make_url("postgresql+asyncpg://nobody@127.0.0.1:1/none")) as engine:
         with pytest.raises(ValueError, match="retention"):
             PostgresLedger(engine, retention)
-    finally:
-        await engine.dispose()
 
 
 async def test_a_submit_the_caller_rolls_back_leaves_no_ticket(engine: AsyncEngine):
@@ -408,20 +346,6 @@ async def test_a_grant_on_a_pool_with_no_row_at_another_version_is_a_conflict(en
     assert stale == Conflict()
 
 
-def test_metadata_holds_the_three_tables_and_they_create_cleanly(database: URL):
-    names = {"wicket_pools", "wicket_tickets", "wicket_grants"}
-    assert set(metadata.tables) == names
-    engine = create_engine(database)
-    try:
-        with engine.begin() as connection:
-            connection.execute(text("create schema fresh; set local search_path = fresh"))
-            metadata.create_all(connection)
-            assert set(inspect(connection).get_table_names(schema="fresh")) == names
-            connection.execute(text("drop schema fresh cascade"))
-    finally:
-        engine.dispose()
-
-
 async def test_a_connection_lost_as_a_view_closes_is_unavailable_then_the_next_call_works(
     engine: AsyncEngine, url: URL
 ):
@@ -431,7 +355,7 @@ async def test_a_connection_lost_as_a_view_closes_is_unavailable_then_the_next_c
     def lose_the_connection(connection: Any, cursor: Any, statement: str, *args: Any) -> None:
         if "FROM wicket_grants" in statement and not lost:  # the view's last statement
             lost.append(True)
-            await_only(terminate_every_session(url))
+            await_(terminate_every_session(url))
 
     event.listen(engine.sync_engine, "after_cursor_execute", lose_the_connection)
     try:

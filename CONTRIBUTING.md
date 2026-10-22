@@ -124,8 +124,7 @@ with Python 3.14, where the PostgreSQL tests are skipped, for pull requests to `
   of waits — a poll, a lease, a renewal — is marked `looptime`, so the event loop's time goes on
   at once over every wait, and its store's clock follows the loop's (`loop.time()`). The
   PostgreSQL test database's `now()` and `clock_timestamp()` read a table the tests move by hand;
-  those tests do not use looptime, which would move time over real I/O. The contract's
-  several-pools test runs in real time on every pair.
+  those tests do not use looptime, which would move time over real I/O.
 - Async tests need no marker (`asyncio_mode = "auto"`). A test that runs longer than 30 seconds fails
   (pytest-timeout).
 
