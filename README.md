@@ -1,57 +1,124 @@
-# wicket
+<div align="center">
 
-Fair admission of work to shared capacity, for Python.
+<h1>wicket</h1>
 
-wicket decides **which waiting piece of work may start now**: by priority, by fairness between the
-parties that submit it, and within limits on how much runs at once and how fast it starts. It does
-not run the work, retry it or keep its status. It sits beside the queue you already have and tells
-your workers what to take next.
+<h3>Which waiting job may start now?</h3>
 
-> **Status:** the core, the in-memory store and the PostgreSQL store are built and unreleased. The
-> decisions behind the design are in
-> [docs/decisions](https://github.com/deyna256/wicket/tree/main/docs/decisions).
+<p>Fair admission of work to shared capacity, for asyncio Python:<br>
+priority, fairness between tenants, and limits that hold across every process.</p>
 
-## The idea
+[![CI](https://github.com/deyna256/wicket/actions/workflows/ci.yml/badge.svg)](https://github.com/deyna256/wicket/actions/workflows/ci.yml)
+![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/deyna256/wicket/blob/main/LICENSE)
+
+[Quick start](https://github.com/deyna256/wicket#quick-start) ·
+[PostgreSQL](https://github.com/deyna256/wicket#postgresql) ·
+[Decisions](https://github.com/deyna256/wicket/tree/main/docs/decisions) ·
+[Changelog](https://github.com/deyna256/wicket/blob/main/CHANGELOG.md)
+
+</div>
+
+## Why wicket
+
+One tenant submits a thousand jobs, another submits one. A plain queue makes the second wait behind
+the first thousand. wicket sits beside the queue you already have and tells your workers what to
+take next.
+
+- **Fair from the first grant.** Tenants get their turns by Start-time Fair Queuing; one who comes
+  back after a break gets no burst of turns.
+- **Priority you can read.** A weighted sum of factors: whose turn it is, a trait such as the plan
+  tier, how long the job has waited.
+- **Limits across processes.** Concurrency and rate hold for any number of workers: every grant is a
+  compare-and-swap on the pool's version.
+- **Safe when a worker dies.** Its lease ends and the job is delivered again; a fencing token rejects
+  the old worker's late write.
+- **Small.** One dependency, msgspec. An in-memory store, and a PostgreSQL one that commits a job
+  in your own transaction.
+
+wicket does not run the work, retry it or keep its status. It decides what starts.
+
+## Quick start
+
+```sh
+pip install "wicket @ git+https://github.com/deyna256/wicket"
+```
 
 ```python
-await backlog.submit("materials", Ticket(id=row_id, tenant=str(user_id), traits={"tier": 1.0}))
+import asyncio
+from datetime import timedelta
 
+from wicket import (
+    Concurrency, FairShare, MemoryBacklog, MemoryLedger, MemoryState, Pool, Priority, Ticket,
+)
+
+
+async def main() -> None:
+    state = MemoryState()
+    backlog, ledger = MemoryBacklog(state), MemoryLedger(state)
+
+    # alice floods the queue first, bob asks once
+    for n in range(3):
+        await backlog.submit("reports", Ticket(id=f"alice-{n}", tenant="alice"))
+    await backlog.submit("reports", Ticket(id="bob-0", tenant="bob"))
+
+    pool = Pool(
+        ledger,
+        "reports",
+        priority=Priority((FairShare(), 1)),
+        limits=(Concurrency(2),),
+        lease=timedelta(seconds=30),
+        poll=timedelta(milliseconds=50),
+    )
+
+    async def worker() -> None:
+        async with pool.permit() as permit:  # waits for its turn, keeps the lease while it runs
+            print("started", permit.waiting.ticket.id)
+            await asyncio.sleep(0.1)  # the work
+
+    await asyncio.gather(*(worker() for _ in range(4)))
+
+
+asyncio.run(main())
+```
+
+```text
+started alice-0
+started bob-0
+started alice-1
+started alice-2
+```
+
+Bob submitted last and starts second. Only a block that ends normally releases its ticket; after an
+error the ticket comes back once its lease ends.
+
+## Priority and limits
+
+Factors score tickets in `0..1` and are weighted; limits hold together:
+
+```python
 pool = Pool(
     ledger,
     "materials",
     priority=Priority(
         (FairShare(), 4),
-        (Trait("tier"), 2),
+        (Trait("tier"), 2),  # Ticket(..., traits={"tier": 1.0})
         (Age(full_after=timedelta(minutes=30)), 1),
     ),
     limits=(Concurrency(4), Rate(10, per=timedelta(minutes=1))),
     lease=timedelta(minutes=2),
     poll=timedelta(seconds=1),
 )
-
-async with pool.permit() as permit:  # waits for a grant, renews the lease while the block runs
-    # only a block that ends normally releases; otherwise the ticket comes back after its lease
-    await generate(permit.waiting.ticket.id)
 ```
-
-- Two users who each submit ten tickets get them in turns from the first grant, by Start-time Fair
-  Queuing; one who returns after a break gets no burst of turns.
-- Priority is a weighted sum of factors, each scoring tickets in `0..1`: whose turn it is, a trait
-  you give the ticket such as its plan tier, how long it has waited.
-- Limits hold across any number of processes: every grant is a compare-and-swap on the pool's version.
-- A worker that dies loses its lease, and the ticket is delivered again; a fencing token rejects the
-  old worker's late write.
-- State lives behind two small ports, `Backlog` and `Ledger`, with an in-memory store and a
-  PostgreSQL one.
 
 ## PostgreSQL
 
-`pip install "wicket[postgres]"` brings SQLAlchemy; bring your driver (asyncpg or psycopg).
+The extra brings SQLAlchemy; bring your driver, asyncpg or psycopg.
+
+```sh
+pip install "wicket[postgres] @ git+https://github.com/deyna256/wicket"
+```
 
 ```python
-from datetime import timedelta
-
-from wicket import Ticket
 from wicket.postgres import PostgresBacklog, PostgresLedger, metadata
 
 # in your Alembic env.py: target_metadata = [your_metadata, metadata]
@@ -64,13 +131,25 @@ async with session.begin():  # your transaction: the row and its ticket commit t
 ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retention in every process
 ```
 
+## Status
+
+wicket is pre-alpha and not yet on PyPI. The API may change before 1.0; every change is in the
+[changelog](https://github.com/deyna256/wicket/blob/main/CHANGELOG.md).
+
 ## Documentation
 
-- [Architecture](https://github.com/deyna256/wicket/blob/main/ARCHITECTURE.md): how the code is laid out
-  and the rules it keeps.
+- [Architecture](https://github.com/deyna256/wicket/blob/main/ARCHITECTURE.md): how the code is laid
+  out and the rules it keeps.
 - [Decisions](https://github.com/deyna256/wicket/tree/main/docs/decisions): why it is shaped this way.
-- [Contributing](https://github.com/deyna256/wicket/blob/main/CONTRIBUTING.md).
+
+## Contributing
+
+Issues and pull requests are welcome. Read
+[CONTRIBUTING.md](https://github.com/deyna256/wicket/blob/main/CONTRIBUTING.md) first, and follow the
+[Code of Conduct](https://github.com/deyna256/wicket/blob/main/CODE_OF_CONDUCT.md). Report
+vulnerabilities privately, as the
+[security policy](https://github.com/deyna256/wicket/blob/main/SECURITY.md) says.
 
 ## License
 
-[MIT](https://github.com/deyna256/wicket/blob/main/LICENSE).
+[MIT](https://github.com/deyna256/wicket/blob/main/LICENSE)
