@@ -23,7 +23,6 @@ try:
         exc,
         func,
         insert,
-        literal,
         or_,
         select,
         update,
@@ -168,65 +167,45 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         async with self._connection(_SNAPSHOT) as connection:
             # now(), the transaction's start, comes before the snapshot: with clock_timestamp(), a
             # renewal committed after the snapshot would look expired. No test tells them apart.
-            now = (await connection.execute(select(func.now()))).scalar_one()
-            head = (
-                await connection.execute(
-                    select(_pools.c.version, _pools.c.fairness).where(_pools.c.name == pool)
-                )
-            ).first()
-            rows = (await connection.execute(select(_tickets).where(_tickets.c.pool == pool))).all()
-            times = (
-                await connection.execute(
-                    select(_grants.c.at)
-                    .where(
-                        _grants.c.pool == pool, _grants.c.at > now - self._seconds(self.retention)
-                    )
-                    .order_by(_grants.c.at)
-                )
-            ).scalars()
+            now = (await connection.execute(select(func.now()))).scalar_one().astimezone(UTC)
+            head = select(_pools.c.version, _pools.c.fairness).where(_pools.c.name == pool)
+            tickets = select(_tickets, (_tickets.c.lease_end > now).label("leased")).where(
+                _tickets.c.pool == pool
+            )
+            history = (
+                select(_grants.c.at)
+                .where(_grants.c.pool == pool, _grants.c.at > now - self.retention)
+                .order_by(_grants.c.at)
+            )
+            known = (await connection.execute(head)).first()
+            rows = (await connection.execute(tickets)).all()
+            times = await connection.scalars(history)
             moments = tuple(at.astimezone(UTC) for at in times)
-        now = now.astimezone(UTC)
-        waiting, leased = [], []
-        for row in rows:
-            (leased if row.lease_end is not None and row.lease_end > now else waiting).append(row)
         return PoolView(
             now=now,
             retention=self.retention,
-            waiting=tuple(self._waiting(row) for row in waiting),
-            leased=tuple(
-                Permit(
-                    pool,
-                    msgspec.structs.replace(self._waiting(row), grants=row.grants - 1),
-                    row.granted_at.astimezone(UTC),
-                    row.token,
-                )
-                for row in leased
-            ),
+            waiting=tuple(self._waiting(row) for row in rows if not row.leased),
+            leased=tuple(self._permit(pool, row) for row in rows if row.leased),
             grant_times=moments,
-            fairness=msgspec.convert(head.fairness, Fairness) if head else Fairness(),
-            version=head.version if head else 0,
+            fairness=msgspec.convert(known.fairness, Fairness) if known else Fairness(),
+            version=known.version if known else 0,
         )
 
     async def grant(
         self, pool: str, ticket_id: str, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
+        first = upsert(_pools).values(name=pool, version=1, fairness=msgspec.to_builtins(fairness))
+        bump = first.on_conflict_do_update(
+            index_elements=[_pools.c.name],
+            set_={"version": _pools.c.version + 1, "fairness": first.excluded.fairness},
+            where=_pools.c.version == version,
+        ).returning(_pools.c.version, func.clock_timestamp().label("now"))
         async with self._connection(_COMMITTED) as connection:
-            bump = upsert(_pools).values(
-                name=pool, version=1, fairness=msgspec.to_builtins(fairness)
-            )
-            bumped = (
-                await connection.execute(
-                    bump.on_conflict_do_update(
-                        index_elements=[_pools.c.name],
-                        set_={"version": _pools.c.version + 1, "fairness": bump.excluded.fairness},
-                        where=_pools.c.version == version,
-                    ).returning(_pools.c.version, func.clock_timestamp())
-                )
-            ).first()
-            if bumped is None or bumped[0] != version + 1:  # an insert at a view of another version
+            bumped = (await connection.execute(bump)).first()
+            if bumped is None or bumped.version != version + 1:  # an insert at another version
                 await connection.rollback()
                 return Conflict()
-            token, now = bumped
+            now = bumped.now.astimezone(UTC)
             waiting = (
                 select(_tickets.c.id)
                 .where(
@@ -238,37 +217,29 @@ class PostgresLedger(msgspec.Struct, frozen=True):
                 .with_for_update(skip_locked=True)
                 .scalar_subquery()
             )
-            row = (
-                await connection.execute(
-                    update(_tickets)
-                    .where(_tickets.c.pool == pool, _tickets.c.id == waiting)
-                    .values(
-                        grants=_tickets.c.grants + 1,
-                        granted_at=now,
-                        token=token,
-                        lease_end=literal(now) + self._seconds(lease),
-                    )
-                    .returning(
-                        _tickets.c.id,
-                        _tickets.c.tenant,
-                        _tickets.c.traits,
-                        _tickets.c.submitted_at,
-                        (_tickets.c.grants - 1).label("grants"),
-                    )
+            take = (
+                update(_tickets)
+                .where(_tickets.c.pool == pool, _tickets.c.id == waiting)
+                # the version this grant made is its permit's token
+                .values(
+                    grants=_tickets.c.grants + 1,
+                    granted_at=now,
+                    token=bumped.version,
+                    lease_end=now + lease,
                 )
-            ).first()
+                .returning(_tickets)
+            )
+            row = (await connection.execute(take)).first()
             if row is None:
                 await connection.rollback()
                 return Missing()
-            await connection.execute(insert(_grants).values(pool=pool, at=now))
-            await connection.execute(
-                delete(_grants).where(
-                    _grants.c.pool == pool,
-                    _grants.c.at <= literal(now) - self._seconds(self.retention),
-                )
+            forget = delete(_grants).where(
+                _grants.c.pool == pool, _grants.c.at <= now - self.retention
             )
+            await connection.execute(insert(_grants).values(pool=pool, at=now))
+            await connection.execute(forget)
             await connection.commit()
-        return Permit(pool, self._waiting(row), now.astimezone(UTC), token)
+        return self._permit(pool, row)
 
     async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost:
         async with self._connection(_COMMITTED) as connection:
@@ -307,6 +278,11 @@ class PostgresLedger(msgspec.Struct, frozen=True):
     def _seconds(self, time: timedelta) -> ColumnElement[Any]:
         """A duration in seconds: `interval '1 day'` across a daylight-saving change lasts 23 h."""
         return func.make_interval(0, 0, 0, 0, 0, 0, time.total_seconds())
+
+    def _permit(self, pool: str, row: Row[*tuple[Any, ...]]) -> Permit:
+        """A leased ticket: its row counts this grant, the permit's waiting only those before."""
+        waiting = msgspec.structs.replace(self._waiting(row), grants=row.grants - 1)
+        return Permit(pool, waiting, row.granted_at.astimezone(UTC), row.token)
 
     def _waiting(self, row: Row[*tuple[Any, ...]]) -> Waiting:
         """A ticket read back through Ticket's own checks, at UTC whatever the session's zone."""
