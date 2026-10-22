@@ -65,6 +65,7 @@ dev = [
 asyncio_mode = "auto"
 testpaths = ["tests"]
 timeout = 30
+markers = ["postgres: the test needs the PostgreSQL test database (see tests/conftest.py)"]
 filterwarnings = ["ignore:There is no current event loop:DeprecationWarning:looptime"]
 
 [tool.ruff]

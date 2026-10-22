@@ -1,8 +1,8 @@
 """The PostgreSQL test database, set up after collection and before the first test, so that starting
-a container does not count against a test's timeout, and only if a collected test uses it: the
-server WICKET_POSTGRES_URL names, or a postgres:18-alpine container, or neither, and the PostgreSQL
-tests are skipped. On that server the session makes a database of its own, with the tables and a
-clock the tests move by hand, and drops it at the end."""
+a container does not count against a test's timeout, and only if a collected test is marked
+`postgres`: the server WICKET_POSTGRES_URL names, or a postgres:18-alpine container, or neither, and
+the PostgreSQL tests are skipped. On that server the session makes a database of its own, with the
+tables and a clock the tests move by hand, and drops it at the end."""
 
 import os
 import secrets
@@ -28,7 +28,7 @@ found: dict[str, Any] = {}  # what the session found: "server", "database", "con
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
-    if not any("database" in getattr(item, "fixturenames", ()) for item in session.items):
+    if not any(item.get_closest_marker("postgres") for item in session.items):
         return
     named = os.environ.get("WICKET_POSTGRES_URL")
     if named is None:
@@ -90,4 +90,6 @@ def database() -> URL:
     """The test database (psycopg's URL; set another driver with `.set(drivername=...)`)."""
     if "skip" in found:
         pytest.skip(str(found["skip"]))
+    if "database" not in found:
+        pytest.fail("the test database was not set up: mark the test with @pytest.mark.postgres")
     return found["database"]

@@ -112,7 +112,8 @@ with Python 3.14, where the PostgreSQL tests are skipped, for pull requests to `
   `WICKET_POSTGRES_URL` names (its role needs `CREATEDB`), or else a container started with
   testcontainers when Docker is running; with neither they are skipped. They make a database of
   their own on that server and drop it at the end, so a URL to a real server never touches its
-  data; a URL that cannot be reached stops the run.
+  data; a URL that cannot be reached stops the run. A test that needs the PostgreSQL test database
+  is marked `postgres`.
 - Test through the public interface. A test that needs a private attribute means the class has the
   wrong shape.
 - The decision — `Fairness`, `Priority`, the factors and the limits — is tested as pure functions of a

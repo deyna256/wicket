@@ -119,7 +119,11 @@ class Pair(Protocol):
     async def elapse(self, time: timedelta) -> None: ...
 
 
-STORES = ["memory", "postgres-asyncpg", "postgres-psycopg"]
+STORES = [
+    "memory",
+    pytest.param("postgres-asyncpg", marks=pytest.mark.postgres),
+    pytest.param("postgres-psycopg", marks=pytest.mark.postgres),
+]
 
 
 @pytest.fixture(params=STORES)
@@ -130,8 +134,8 @@ async def store(request: pytest.FixtureRequest) -> AsyncGenerator[Pair, None]:
     database: URL = request.getfixturevalue("database")
     driver = request.param.removeprefix("postgres-")
     pair = PostgresPair(database.set(drivername=f"postgresql+{driver}"))
-    await pair.start()
     try:
+        await pair.start()
         yield pair
     finally:
         await pair.stop()

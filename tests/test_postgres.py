@@ -22,6 +22,8 @@ from wicket.postgres import PostgresBacklog, PostgresLedger, metadata
 from wicket.results import Conflict, Missing, Renewed, StoreUnavailable
 from wicket.tickets import Permit, Ticket, Waiting
 
+pytestmark = pytest.mark.postgres
+
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 LEASE = timedelta(seconds=30)
 HOUR = timedelta(hours=1)
