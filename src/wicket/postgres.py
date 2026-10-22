@@ -7,28 +7,34 @@ from datetime import UTC, timedelta
 from typing import Any
 
 import msgspec
-from sqlalchemy import (
-    BigInteger,
-    Column,
-    ColumnElement,
-    Index,
-    Integer,
-    MetaData,
-    Row,
-    Table,
-    Text,
-    delete,
-    exc,
-    func,
-    insert,
-    literal,
-    or_,
-    select,
-    update,
-)
-from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
-from sqlalchemy.dialects.postgresql import insert as upsert
-from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+
+try:
+    from sqlalchemy import (
+        BigInteger,
+        Column,
+        ColumnElement,
+        Index,
+        Integer,
+        MetaData,
+        Row,
+        Table,
+        Text,
+        delete,
+        exc,
+        func,
+        insert,
+        literal,
+        or_,
+        select,
+        update,
+    )
+    from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
+    from sqlalchemy.dialects.postgresql import insert as upsert
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
+except ModuleNotFoundError as error:
+    raise ModuleNotFoundError(
+        "wicket.postgres needs SQLAlchemy: pip install 'wicket[postgres]'", name=error.name
+    ) from error
 
 from wicket.fairness import Fairness
 from wicket.results import (
@@ -44,6 +50,8 @@ from wicket.results import (
 )
 from wicket.tickets import Permit, Ticket, Version, Waiting
 from wicket.view import PoolView
+
+__all__ = ["PostgresBacklog", "PostgresLedger", "metadata"]
 
 metadata = MetaData()
 
