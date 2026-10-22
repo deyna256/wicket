@@ -12,7 +12,7 @@ pool's `Fairness`.
 - **msgspec** for every value: frozen `Struct`s whose `__post_init__` checks run on decoding too,
   so a ticket read from a store is checked as one built in code, and the encoding a store uses.
 - **The PostgreSQL store is an optional extra,** `wicket[postgres]`, so the core installs with
-  msgspec alone. Its driver is chosen when the store is built, in its own decision.
+  msgspec alone; it is built on SQLAlchemy ([decision 7](0007-postgres-store.md)).
 
 ## Alternatives
 

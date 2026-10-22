@@ -7,8 +7,8 @@ parties that submit it, and within limits on how much runs at once and how fast 
 not run the work, retry it or keep its status. It sits beside the queue you already have and tells
 your workers what to take next.
 
-> **Status:** the core and the in-memory store are built and unreleased; the PostgreSQL store is
-> next. The decisions behind the design are in
+> **Status:** the core, the in-memory store and the PostgreSQL store are built and unreleased. The
+> decisions behind the design are in
 > [docs/decisions](https://github.com/deyna256/wicket/tree/main/docs/decisions).
 
 ## The idea
@@ -41,8 +41,24 @@ async with pool.permit() as permit:  # waits for a grant, renews the lease while
 - Limits hold across any number of processes: every grant is a compare-and-swap on the pool's version.
 - A worker that dies loses its lease, and the ticket is delivered again; a fencing token rejects the
   old worker's late write.
-- State lives behind two small ports, `Backlog` and `Ledger`, with an in-memory store (built)
-  and a PostgreSQL one (planned).
+- State lives behind two small ports, `Backlog` and `Ledger`, with an in-memory store and a
+  PostgreSQL one.
+
+## PostgreSQL
+
+`pip install "wicket[postgres]"` brings SQLAlchemy; bring your driver (asyncpg or psycopg).
+
+```python
+from wicket.postgres import PostgresBacklog, PostgresLedger, metadata
+
+# in your Alembic env.py: target_metadata = [your_metadata, metadata]
+
+async with session.begin():  # your transaction: the row and its ticket commit together
+    session.add(row)
+    await PostgresBacklog(session).submit("materials", Ticket(id=str(row.id), tenant=str(user_id)))
+
+ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retention in every process
+```
 
 ## Documentation
 

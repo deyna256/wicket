@@ -3,7 +3,7 @@
 This document is for people who change wicket's code. It describes how the code is laid out and the
 rules that hold everywhere in it. Why the main choices were made is in [docs/decisions](docs/decisions/).
 
-The core and the in-memory store are built; the PostgreSQL store is planned.
+The core, the in-memory store and the PostgreSQL store are built.
 
 ## Bird's eye view
 
@@ -35,13 +35,14 @@ All code is in `src/wicket/`.
 | `limits.py` | the contract `Limit`; `Concurrency`, `Rate` |
 | `store.py` | the ports `Backlog` and `Ledger` |
 | `memory.py` | the in-memory store: `MemoryState` and its two adapters `MemoryBacklog` and `MemoryLedger` |
+| `postgres.py` | the PostgreSQL store, in the extra `wicket[postgres]`: its tables on `metadata`, `PostgresBacklog` on the caller's session, `PostgresLedger` on an engine, and `_Reach`, where a driver's error becomes `StoreUnavailable` |
 | `pool.py` | `Pool`, which waits for grants and keeps a permit's lease while its block runs |
 
-`tests/test_store_contract.py` is `StoreContract`, the suite every pair of store adapters passes.
-The `postgres` extra, `PostgresBacklog` on the caller's session and `PostgresLedger` on its own
-engine, is planned.
+`tests/test_store_contract.py` is `StoreContract`, the suite every pair of store adapters passes;
+it runs on the in-memory pair and on PostgreSQL through asyncpg and psycopg.
 
-The public API is `wicket.__all__`. Everything else may change without notice.
+The public API is `wicket.__all__`, and `wicket.postgres` for the extra. Everything else may change
+without notice.
 
 ## Invariants
 
@@ -103,5 +104,6 @@ is delivered again once its lease ends, and the permit's token lets the caller r
 worker's late write ([decision 5](docs/decisions/0005-leases.md)). A store that cannot be reached
 raises `StoreUnavailable`, the one store error `Pool` retries, and only while renewing a lease.
 
-**Dependencies.** msgspec; why is in [decision 6](docs/decisions/0006-dependencies.md). Adding a
-runtime dependency needs an ADR.
+**Dependencies.** msgspec; why is in [decision 6](docs/decisions/0006-dependencies.md). The extra
+`postgres` adds SQLAlchemy ([decision 7](docs/decisions/0007-postgres-store.md)). Adding a runtime
+dependency needs an ADR.

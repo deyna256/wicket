@@ -98,17 +98,24 @@ still reports needs a person.
 Run the relevant checks before submitting changes. Documentation-only changes need link and formatting
 checks, not tests.
 
-The [CI workflow](.github/workflows/ci.yml) runs `just lint` and `just type` once, and `just test` on
-Ubuntu with Python 3.12, 3.13 and 3.14, and on Windows and macOS with Python 3.14, for pull requests
-to `main` and pushes to `main`. It fails when `uv.lock` is out of date.
+The [CI workflow](.github/workflows/ci.yml) runs `just lint` and `just type` once, and `just test`
+on Ubuntu with Python 3.12, 3.13 and 3.14 against a PostgreSQL service, and on Windows and macOS
+with Python 3.14, where the PostgreSQL tests are skipped, for pull requests to `main` and pushes to
+`main`. It fails when `uv.lock` is out of date.
 
 [Dependabot](.github/dependabot.yml) opens a pull request once a month with updated dependencies in
 `uv.lock`, and another with new versions of the GitHub Actions; CI checks them like any other.
 
 ## Tests
 
-- Tests live in `tests/` and run without a database: use the in-memory store. The PostgreSQL store's
-  tests run against a real PostgreSQL and are skipped when none is configured.
+- Tests live in `tests/`. The PostgreSQL store's tests run against a real PostgreSQL: the server
+  `WICKET_POSTGRES_URL` names (its role needs `CREATEDB`), or else a container started with
+  testcontainers when Docker is running; with neither they are skipped. They make a database of
+  their own on that server and drop it at the end, so a URL to a real server never touches its
+  data; a URL that cannot be reached stops the run.
+- The PostgreSQL test database's `now()` and `clock_timestamp()` read a table the tests move by
+  hand, so its tests wait no more than the in-memory ones; they run without looptime, which would
+  move time over real I/O. The contract's several-pools test runs in real time on every pair.
 - Test through the public interface. A test that needs a private attribute means the class has the
   wrong shape.
 - The decision — `Fairness`, `Priority`, the factors and the limits — is tested as pure functions of a
