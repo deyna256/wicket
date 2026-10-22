@@ -87,8 +87,8 @@ jobs:
       - name: Run tests
         run: just test
 
-  # Windows and macOS runners have no service containers and no Linux Docker: the PostgreSQL tests
-  # are skipped there, and the rest run as on Ubuntu.
+  # Windows and macOS runners have no service containers, and their Docker, if any, cannot run
+  # Linux images: the PostgreSQL tests are skipped there, and the rest run as on Ubuntu.
   test-other-systems:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 15
