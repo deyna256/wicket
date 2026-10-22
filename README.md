@@ -10,8 +10,9 @@
 <p>Fair admission of work to shared capacity, for asyncio Python:<br>
 priority, fairness between tenants, and limits that hold across every process.</p>
 
+[![PyPI](https://img.shields.io/pypi/v/wicket)](https://pypi.org/project/wicket/)
+[![Python](https://img.shields.io/pypi/pyversions/wicket)](https://pypi.org/project/wicket/)
 [![CI](https://github.com/deyna256/wicket/actions/workflows/ci.yml/badge.svg)](https://github.com/deyna256/wicket/actions/workflows/ci.yml)
-![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](https://github.com/deyna256/wicket/blob/main/LICENSE)
 
 [Quick start](https://github.com/deyna256/wicket#quick-start) ·
@@ -22,7 +23,10 @@ priority, fairness between tenants, and limits that hold across every process.</
 </div>
 
 <p align="center">
-  <img alt="alice asks for 6 reports, bob for 2, carol for 1. In a plain queue carol starts last, 9th; with wicket she starts 3rd" src="https://raw.githubusercontent.com/deyna256/wicket/main/docs/assets/demo.svg" width="720">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/deyna256/wicket/main/docs/assets/demo-dark.svg">
+    <img alt="alice asks for 6 reports, bob for 2, carol for 1. In a plain queue carol starts last, 9th; with wicket she starts 3rd" src="https://raw.githubusercontent.com/deyna256/wicket/main/docs/assets/demo-light.svg" width="720">
+  </picture>
 </p>
 
 ## Why wicket
@@ -47,7 +51,7 @@ wicket does not run the work, retry it or keep its status. It decides what start
 ## Quick start
 
 ```sh
-pip install "wicket @ git+https://github.com/deyna256/wicket"
+pip install wicket
 ```
 
 ```python
@@ -122,7 +126,7 @@ pool = Pool(
 The extra brings SQLAlchemy; bring your driver, asyncpg or psycopg.
 
 ```sh
-pip install "wicket[postgres] @ git+https://github.com/deyna256/wicket"
+pip install "wicket[postgres]"
 ```
 
 ```python
@@ -140,7 +144,7 @@ ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retent
 
 ## Status
 
-wicket is pre-alpha and not yet on PyPI. The API may change before 1.0; every change is in the
+wicket is pre-alpha: the API may change before 1.0, and every change is in the
 [changelog](https://github.com/deyna256/wicket/blob/main/CHANGELOG.md).
 
 ## Documentation
