@@ -1,6 +1,7 @@
 """What only the PostgreSQL store can show: other transactions, isolation, time zones, cancellation,
-a server that goes away, and the schema. Every test runs on asyncpg and on psycopg, on the test
-database whose clock the tests move by hand (see conftest.py)."""
+a server that goes away or a schema it lacks, and pools of several processes on one database. Every
+test runs on asyncpg and on psycopg, on the test database whose clock the tests move by hand (see
+conftest.py)."""
 
 import asyncio
 import contextlib
@@ -17,8 +18,10 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.util import await_
 
 from wicket.fairness import Fairness
-from wicket.limits import Rate
+from wicket.limits import Concurrency, Rate
+from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
+from wicket.priority import FairShare, Priority
 from wicket.results import Conflict, Missing, Renewed, StoreUnavailable
 from wicket.tickets import Permit, Ticket, Waiting
 
@@ -189,7 +192,7 @@ async def test_a_grant_that_waited_on_the_pool_is_a_conflict_whatever_the_engine
 
 @pytest.mark.parametrize("level", ["SERIALIZABLE", "REPEATABLE READ", "AUTOCOMMIT"])
 async def test_grants_answer_one_permit_and_conflicts_whatever_the_engine(url: URL, level: str):
-    async with emptied(url, EPOCH, isolation_level=level) as engine:
+    async with emptied(url, EPOCH, isolation_level=level, pool_size=25) as engine:
         await submit(engine, *map(str, range(21)))
         ledger = PostgresLedger(engine, HOUR)
         view = await ledger.view("p")
@@ -365,3 +368,34 @@ async def test_a_connection_lost_as_a_view_closes_is_unavailable_then_the_next_c
         event.remove(engine.sync_engine, "after_cursor_execute", lose_the_connection)
     assert lost
     await ledger.view("p")
+
+
+async def test_pools_of_several_processes_never_exceed_the_limit(url: URL):
+    async with emptied(url, EPOCH) as engine, opened(url) as other:
+        await submit(engine, *map(str, range(12)))
+        pools = [
+            Pool(
+                PostgresLedger(serving, HOUR),
+                "p",
+                priority=Priority((FairShare(), 1)),
+                limits=(Concurrency(2),),
+                lease=HOUR,
+                poll=timedelta(milliseconds=20),
+            )
+            for serving in (engine, other, other)  # three "processes", two of them on one engine
+        ]
+        running = peak = 0
+
+        async def worker(serving: Pool) -> None:
+            nonlocal running, peak
+            for _ in range(2):
+                async with serving.permit():
+                    running += 1
+                    peak = max(peak, running)
+                    await asyncio.sleep(0.03)
+                    running -= 1
+
+        await asyncio.gather(*(worker(pools[n % 3]) for n in range(6)))
+        left = (await PostgresLedger(engine, HOUR).view("p")).waiting
+    assert peak == 2
+    assert left == ()
