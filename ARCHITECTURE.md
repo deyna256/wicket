@@ -10,8 +10,8 @@ The core, the in-memory store and the PostgreSQL store are built.
 wicket decides which waiting ticket of a pool may start now. Producers submit tickets to a `Backlog`;
 workers ask a `Pool` for a permit. To grant one, the pool reads a snapshot of itself from its
 `Ledger`, asks its limits whether one more may start, lets its priority choose the ticket, and writes
-the grant only if the snapshot's version is still current. The worker holds the permit as a lease
-that the pool renews until the work is done.
+the grant only if the snapshot's version is still current and the chosen submission still exists.
+The worker holds the permit as a lease that the pool renews until the work is done.
 
 ```text
 producer ──▶ Backlog.submit ──▶ store ◀── Ledger.view / grant / renew / release ◀── Pool.permit() ◀── worker
@@ -98,6 +98,10 @@ a grant one at a time behind its lock, so only processes conflict and a process 
 `poll`. On a conflict the pool reads again at once; with nothing to grant it sleeps a random time
 between `poll / 2` and `poll`
 ([decision 2](docs/decisions/0002-pure-decision-over-a-store.md)).
+
+Each `Waiting` carries a store-generated UUIDv4 `submission_id`. A grant matches it with the pool
+and ticket id, returning `Missing` if the ticket was removed and replaced. The identity and its
+lifecycle are defined in [decision 2](docs/decisions/0002-pure-decision-over-a-store.md).
 
 **Failure.** Delivery is at least once. Only a block that ends normally releases its ticket; an
 error of the body, a cancellation or a lost lease (`LeaseLostError`) releases nothing, so the ticket

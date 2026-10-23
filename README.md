@@ -157,6 +157,10 @@ async with session.begin():  # your transaction: the row and its ticket commit t
 ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retention in every process
 ```
 
+Existing databases need the
+[submission ID migration](https://github.com/deyna256/wicket/blob/main/docs/decisions/0007-postgres-store.md#adding-submission-ids-to-an-existing-table)
+before using the updated adapters.
+
 ## Status
 
 wicket is pre-alpha: the API may change before 1.0, and every change is in the

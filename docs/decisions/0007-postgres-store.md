@@ -25,6 +25,9 @@ is usually SQLAlchemy.
   accepts the name-to-number objects written by 0.1.0 and validates both formats through `Ticket`.
 - **The store's clock only**: a view reads `now()`, every other call `clock_timestamp()`, and times
   are read back as UTC.
+- **Submission identity is a UUID column with `gen_random_uuid()` as its default.** A grant matches
+  it while locking the chosen ticket with `SKIP LOCKED`; withdrawals need no pool-row lock
+  ([decision 2](0002-pure-decision-over-a-store.md)).
 
 ## Alternatives
 
@@ -46,3 +49,22 @@ is usually SQLAlchemy.
 - Upgrade every process sharing a pool before writing the new trait format: 0.1.0 readers cannot
   read the arrays. Existing rows need no migration; the JSONB column's type stays the same.
 - The PostgreSQL tests need a database: a server URL or Docker; CI runs them on Ubuntu.
+
+## Adding submission IDs to an existing table
+
+Stop producers and workers sharing the table. Add this to the caller's migrations before starting
+the updated adapters:
+
+```sql
+ALTER TABLE wicket_tickets
+    ADD COLUMN submission_id uuid NOT NULL DEFAULT gen_random_uuid();
+```
+
+PostgreSQL gives every existing row a UUID and generates one for each future insert. Ticket data,
+leases, permit tokens and fairness are preserved. `metadata.create_all()` does not alter an existing
+table, so it is not a substitute for this migration.
+
+Upgrade every worker before resuming: old `grant` implementations do not check submission identity.
+Custom ledgers and wrappers must now accept the chosen `Waiting` instead of a ticket id. A manually
+constructed or decoded `Waiting` also requires `submission_id`; discard old cached snapshots and
+read a fresh view after upgrading.

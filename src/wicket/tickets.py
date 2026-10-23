@@ -1,6 +1,7 @@
 """A ticket's traits, the ticket in line, and the permit that leases it."""
 
 from datetime import datetime
+from uuid import UUID
 
 import msgspec
 
@@ -36,10 +37,12 @@ class Ticket(msgspec.Struct, frozen=True):
 
 
 class Waiting(msgspec.Struct, frozen=True):
-    """A ticket in line, with when it was submitted and how many times it was granted before."""
+    """One submission of a ticket, with its store-generated UUID, time and prior grant count.
+    The UUID stays until removal; submitting the same ticket again after removal gets a new one."""
 
     ticket: Ticket
     submitted_at: datetime
+    submission_id: UUID
     grants: int = 0
 
 

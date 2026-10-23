@@ -3,6 +3,7 @@
 import math
 from datetime import UTC, datetime
 from typing import Any
+from uuid import UUID
 
 import msgspec
 import pytest
@@ -84,6 +85,13 @@ def test_decoding_checks_trait_values_and_unique_names(traits: list[dict[str, st
 
 
 def test_a_first_grant_is_attempt_one_and_a_redelivery_counts_on():
-    first = Permit("p", Waiting(Ticket("1", "ann"), EPOCH), EPOCH, 1)
-    again = Permit("p", Waiting(Ticket("1", "ann"), EPOCH, grants=2), EPOCH, 7)
+    first = Permit("p", Waiting(Ticket("1", "ann"), EPOCH, UUID(int=1)), EPOCH, 1)
+    again = Permit("p", Waiting(Ticket("1", "ann"), EPOCH, UUID(int=1), grants=2), EPOCH, 7)
     assert (first.attempt, again.attempt) == (1, 3)
+
+
+@pytest.mark.parametrize("codec", [msgspec.json, msgspec.msgpack])
+def test_a_permits_submission_id_survives_serialization(codec: Any):
+    waiting = Waiting(Ticket("1", "ann"), EPOCH, UUID("b173fb70-e7e9-4ab9-82ee-b921ac53589c"))
+    permit = Permit("p", waiting, EPOCH, 1)
+    assert codec.decode(codec.encode(permit), type=Permit) == permit

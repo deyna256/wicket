@@ -1,6 +1,7 @@
 """Whether a pool may lease one more ticket now."""
 
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import pytest
 
@@ -13,7 +14,10 @@ MINUTE = timedelta(minutes=1)
 
 
 def leased(count: int) -> tuple[Permit, ...]:
-    return tuple(Permit("p", Waiting(Ticket(str(n), "a"), EPOCH), EPOCH, n) for n in range(count))
+    return tuple(
+        Permit("p", Waiting(Ticket(str(n), "a"), EPOCH, UUID(int=n)), EPOCH, n)
+        for n in range(count)
+    )
 
 
 def test_concurrency_admits_fewer_than_its_number_of_leased_tickets():

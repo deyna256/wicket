@@ -20,8 +20,8 @@ class Conflict(msgspec.Struct, frozen=True):
 
 
 class Missing(msgspec.Struct, frozen=True):
-    """The version is current, but the ticket cannot be granted: withdrawn, or held by another
-    transaction."""
+    """The version is current, but the submission cannot be granted: gone, replaced, leased,
+    or held by another transaction."""
 
 
 class Renewed(msgspec.Struct, frozen=True):

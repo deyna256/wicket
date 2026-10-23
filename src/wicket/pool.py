@@ -102,7 +102,7 @@ class Pool:
                     since = asyncio.get_running_loop().time()
                     answer = await self._ledger.grant(
                         self._name,
-                        chosen.ticket.id,
+                        chosen,
                         version=view.version,
                         lease=self._lease,
                         fairness=view.fairness.after(chosen),
@@ -113,7 +113,7 @@ class Pool:
                         case Conflict() as conflict:
                             return conflict
                         case Missing():
-                            view = view.without(chosen.ticket.id)  # withdrawn or held: the next one
+                            view = view.without(chosen.ticket.id)  # gone or held: the next one
 
 
 class _Renewal:

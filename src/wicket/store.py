@@ -16,13 +16,14 @@ from wicket.results import (
     Renewed,
     Withdrawn,
 )
-from wicket.tickets import Permit, Ticket, Version
+from wicket.tickets import Permit, Ticket, Version, Waiting
 from wicket.view import PoolView
 
 
 class Backlog(Protocol):
     async def submit(self, pool: str, ticket: Ticket) -> None:
-        """Put the ticket in line; an id that is waiting or leased changes nothing."""
+        """Put the ticket in line with a new UUIDv4 submission_id. An id that is waiting or
+        leased changes nothing, including its submission_id; an id removed earlier starts anew."""
         ...
 
     async def withdraw(self, pool: str, ticket_id: str) -> Withdrawn | AlreadyLeased | Gone: ...
@@ -32,11 +33,12 @@ class Ledger(Protocol):
     async def view(self, pool: str) -> PoolView: ...
 
     async def grant(
-        self, pool: str, ticket_id: str, *, version: Version, lease: timedelta, fairness: Fairness
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
-        """Lease the ticket if the pool is still at `version` and the ticket is waiting, writing
-        the grant's time and `fairness` with it; never wait on a ticket another transaction
-        holds."""
+        """Lease this submission if the pool is still at `version` and it is waiting. Match
+        both ticket.id and submission_id atomically with the grant; a replacement is Missing.
+        Write the grant's time and `fairness` together; a failed grant changes nothing.
+        Never wait on a ticket another transaction holds."""
         ...
 
     async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost: ...

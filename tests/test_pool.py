@@ -22,7 +22,7 @@ from wicket.results import (
     Renewed,
     StoreUnavailable,
 )
-from wicket.tickets import Permit, Ticket, Version
+from wicket.tickets import Permit, Ticket, Version, Waiting
 from wicket.view import PoolView
 
 pytestmark = pytest.mark.looptime
@@ -64,12 +64,12 @@ class Scripted:
         return await self.ledger.view(pool)
 
     async def grant(
-        self, pool: str, ticket_id: str, *, version: Version, lease: timedelta, fairness: Fairness
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
         if self.grants:
             return self.grants.pop(0)
         return await self.ledger.grant(
-            pool, ticket_id, version=version, lease=lease, fairness=fairness
+            pool, waiting, version=version, lease=lease, fairness=fairness
         )
 
     async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost:
@@ -356,10 +356,10 @@ class Yielding(Scripted):
         return await super().view(pool)
 
     async def grant(
-        self, pool: str, ticket_id: str, *, version: Version, lease: timedelta, fairness: Fairness
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
         await asyncio.sleep(0)
-        return await super().grant(pool, ticket_id, version=version, lease=lease, fairness=fairness)
+        return await super().grant(pool, waiting, version=version, lease=lease, fairness=fairness)
 
 
 class Unreachable(Scripted):

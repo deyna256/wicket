@@ -5,6 +5,7 @@ import math
 import random
 import sys
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import msgspec
 import pytest
@@ -30,7 +31,7 @@ def ticket(
 ) -> Waiting:
     """A waiting ticket submitted `at` seconds after EPOCH, with a tier if one is given."""
     traits = () if tier is None else (Trait("tier", tier),)
-    return Waiting(Ticket(id, tenant, traits), EPOCH + timedelta(seconds=at), grants)
+    return Waiting(Ticket(id, tenant, traits), EPOCH + timedelta(seconds=at), UUID(int=1), grants)
 
 
 def drain(
@@ -188,7 +189,11 @@ def test_a_trait_factor_reads_its_named_trait_among_other_traits():
     view = PoolView(
         now=EPOCH,
         retention=HOUR,
-        waiting=(Waiting(Ticket("1", "a", (Trait("urgent", 1.0), Trait("tier", 0.5))), EPOCH),),
+        waiting=(
+            Waiting(
+                Ticket("1", "a", (Trait("urgent", 1.0), Trait("tier", 0.5))), EPOCH, UUID(int=1)
+            ),
+        ),
     )
     assert TraitFactor("tier").scores(view) == {"1": 0.5}
     assert TraitFactor("missing").scores(view) == {"1": 0.0}

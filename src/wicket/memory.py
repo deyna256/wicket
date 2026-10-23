@@ -3,6 +3,7 @@ methods never await, so each runs whole and needs no lock."""
 
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from uuid import uuid4
 
 import msgspec
 
@@ -72,7 +73,7 @@ class MemoryBacklog(msgspec.Struct, frozen=True):
             copy = msgspec.json.decode(
                 msgspec.json.encode(ticket), type=Ticket
             )  # as a durable store reads it back
-            tickets[ticket.id] = Waiting(copy, self.state.clock())
+            tickets[ticket.id] = Waiting(copy, self.state.clock(), uuid4())
 
     async def withdraw(self, pool: str, ticket_id: str) -> Withdrawn | AlreadyLeased | Gone:
         held = self.state._pool(pool)
@@ -102,17 +103,20 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         )
 
     async def grant(
-        self, pool: str, ticket_id: str, *, version: Version, lease: timedelta, fairness: Fairness
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
         held, now = self.state._pool(pool), self.state.clock()
         if version != held.version:
             return Conflict()
+        ticket_id = waiting.ticket.id
         if ticket_id not in held.tickets or held.leased(ticket_id, now):
             return Missing()
+        current = held.tickets[ticket_id]
+        if current.submission_id != waiting.submission_id:
+            return Missing()
         held.version += 1
-        waiting = held.tickets[ticket_id]
-        permit = Permit(pool, waiting, now, held.version)
-        held.tickets[ticket_id] = msgspec.structs.replace(waiting, grants=waiting.grants + 1)
+        permit = Permit(pool, current, now, held.version)
+        held.tickets[ticket_id] = msgspec.structs.replace(current, grants=current.grants + 1)
         held.leases[ticket_id] = _Lease(permit, now + lease)
         held.grant_times.append(now)
         held.fairness = fairness

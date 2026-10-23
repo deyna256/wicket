@@ -9,6 +9,7 @@ import random
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 import msgspec
 import pytest
@@ -23,7 +24,7 @@ from wicket.limits import Concurrency, Rate
 from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.priority import FairShare, Priority
-from wicket.results import Conflict, Missing, Renewed, StoreUnavailable
+from wicket.results import Conflict, Missing, Renewed, StoreUnavailable, Withdrawn
 from wicket.tickets import Permit, Ticket, Trait, Waiting
 
 pytestmark = pytest.mark.postgres
@@ -67,7 +68,7 @@ async def grant_first(
     first = view.waiting[0]
     return await ledger.grant(
         pool,
-        first.ticket.id,
+        first,
         version=view.version,
         lease=lease,
         fairness=view.fairness.after(first),
@@ -91,6 +92,52 @@ async def terminate_every_session(url: URL) -> None:
     await until(url, f"not exists (select {OTHERS})")
 
 
+async def test_submission_id_migration_preserves_existing_tickets(engine: AsyncEngine):
+    await submit(engine, "1", "2", "3")
+    ledger = PostgresLedger(engine, HOUR)
+    permit = await grant_first(ledger)
+    assert isinstance(permit, Permit)
+    before = await ledger.view("p")
+
+    async with engine.begin() as connection:
+        await connection.execute(text("ALTER TABLE wicket_tickets DROP COLUMN submission_id"))
+        await connection.execute(
+            text(
+                "ALTER TABLE wicket_tickets "
+                "ADD COLUMN submission_id uuid NOT NULL DEFAULT gen_random_uuid()"
+            )
+        )
+        ids = (await connection.execute(text("SELECT submission_id FROM wicket_tickets"))).scalars()
+        submission_ids = list(ids)
+        assert len(set(submission_ids)) == 3
+        assert all(value.version == 4 for value in submission_ids)
+
+    after = await ledger.view("p")
+    originals = {waiting.ticket.id: waiting for waiting in before.waiting}
+    restored = tuple(
+        msgspec.structs.replace(waiting, submission_id=originals[waiting.ticket.id].submission_id)
+        for waiting in after.waiting
+    )
+    leased = msgspec.structs.replace(
+        after.leased[0],
+        waiting=msgspec.structs.replace(
+            after.leased[0].waiting, submission_id=before.leased[0].waiting.submission_id
+        ),
+    )
+    assert msgspec.structs.replace(after, waiting=restored, leased=(leased,)) == before
+    assert await ledger.renew(permit, lease=LEASE) == Renewed()
+    await submit(engine, "4")
+    fresh = await ledger.view("p")
+    added = next(waiting for waiting in fresh.waiting if waiting.ticket.id == "4")
+    assert added.submission_id.version == 4
+    assert isinstance(
+        await ledger.grant(
+            "p", added, version=fresh.version, lease=LEASE, fairness=fresh.fairness.after(added)
+        ),
+        Permit,
+    )
+
+
 async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(engine: AsyncEngine):
     await submit(engine, "1", "2")
     ledger = PostgresLedger(engine, HOUR)
@@ -100,18 +147,59 @@ async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(en
         await PostgresBacklog(caller).withdraw("p", "1")  # left open
         held = await asyncio.wait_for(
             ledger.grant(
-                "p", "1", version=view.version, lease=LEASE, fairness=view.fairness.after(one)
+                "p", one, version=view.version, lease=LEASE, fairness=view.fairness.after(one)
             ),
             1,
         )
         next_one = await asyncio.wait_for(
             ledger.grant(
-                "p", "2", version=view.version, lease=LEASE, fairness=view.fairness.after(two)
+                "p", two, version=view.version, lease=LEASE, fairness=view.fairness.after(two)
             ),
             1,
         )
         assert held == Missing()
         assert isinstance(next_one, Permit)
+
+
+async def test_a_replacement_committed_during_a_grant_is_missing(engine: AsyncEngine):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    stale = await ledger.view("p")
+    replaced: list[bool] = []
+
+    async def replace_ticket() -> None:
+        async with AsyncSession(engine) as producer:
+            backlog = PostgresBacklog(producer)
+            assert await backlog.withdraw("p", "1") == Withdrawn()
+            await backlog.submit("p", Ticket("1", "replacement"))
+            await producer.commit()
+
+    def replace_before_take(connection: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if statement.lstrip().startswith("UPDATE wicket_tickets") and not replaced:
+            replaced.append(True)
+            await_(asyncio.wait_for(replace_ticket(), 1))
+
+    event.listen(engine.sync_engine, "before_cursor_execute", replace_before_take)
+    try:
+        answer = await ledger.grant(
+            "p",
+            stale.waiting[0],
+            version=stale.version,
+            lease=LEASE,
+            fairness=stale.fairness.after(stale.waiting[0]),
+        )
+    finally:
+        event.remove(engine.sync_engine, "before_cursor_execute", replace_before_take)
+    view = await ledger.view("p")
+    assert replaced and answer == Missing()
+    assert (view.version, view.fairness, view.grant_times, view.leased) == (
+        stale.version,
+        stale.fairness,
+        stale.grant_times,
+        (),
+    )
+    assert view.waiting[0].ticket == Ticket("1", "replacement")
+    assert view.waiting[0].grants == 0
 
 
 async def test_traits_written_as_a_dictionary_still_read_as_immutable_values(engine: AsyncEngine):
@@ -158,7 +246,7 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
             granted = await_(
                 rival.grant(
                     "p",
-                    chosen.ticket.id,
+                    chosen,
                     version=first.version,
                     lease=LEASE,
                     fairness=first.fairness.after(chosen),
@@ -197,7 +285,7 @@ async def test_a_grant_that_waited_on_the_pool_is_a_conflict_whatever_the_engine
                     asyncio.ensure_future(
                         ours.grant(
                             "p",
-                            view.waiting[1].ticket.id,
+                            view.waiting[1],
                             version=view.version,
                             lease=LEASE,
                             fairness=view.fairness,
@@ -209,7 +297,7 @@ async def test_a_grant_that_waited_on_the_pool_is_a_conflict_whatever_the_engine
         event.listen(rival_engine.sync_engine, "before_cursor_execute", ours_waits_on_the_pool)
         won = await rival.grant(
             "p",
-            view.waiting[0].ticket.id,
+            view.waiting[0],
             version=view.version,
             lease=LEASE,
             fairness=view.fairness,
@@ -226,16 +314,18 @@ async def test_grants_answer_one_permit_and_conflicts_whatever_the_engine(url: U
         view = await ledger.view("p")
         answers = await asyncio.gather(
             *(
-                ledger.grant(
-                    "p", w.ticket.id, version=view.version, lease=LEASE, fairness=view.fairness
-                )
+                ledger.grant("p", w, version=view.version, lease=LEASE, fairness=view.fairness)
                 for w in view.waiting[:20]
             )
         )
         assert sorted(type(a).__name__ for a in answers) == ["Conflict"] * 19 + ["Permit"]
         view = await ledger.view("p")
         missing = await ledger.grant(
-            "p", "nobody", version=view.version, lease=LEASE, fairness=view.fairness
+            "p",
+            msgspec.structs.replace(view.waiting[0], ticket=Ticket("nobody", "a")),
+            version=view.version,
+            lease=LEASE,
+            fairness=view.fairness,
         )
         assert missing == Missing()
         assert (await ledger.view("p")).version == view.version
@@ -326,12 +416,12 @@ async def test_after_a_server_restart_one_call_is_unavailable_then_calls_work(
 @pytest.mark.parametrize("unreachable", ["closed port", "unknown role"])
 async def test_an_unreachable_server_is_unavailable_to_every_call(url: URL, unreachable: str):
     wrong = url.set(port=1) if unreachable == "closed port" else url.set(username="nobody")
-    permit = Permit("p", Waiting(Ticket("1", "a"), EPOCH), EPOCH, 1)
+    permit = Permit("p", Waiting(Ticket("1", "a"), EPOCH, UUID(int=1)), EPOCH, 1)
     async with opened(wrong) as engine:
         ledger = PostgresLedger(engine, HOUR)
         calls: list[Callable[[], Any]] = [
             lambda: ledger.view("p"),
-            lambda: ledger.grant("p", "1", version=0, lease=LEASE, fairness=Fairness()),
+            lambda: ledger.grant("p", permit.waiting, version=0, lease=LEASE, fairness=Fairness()),
             lambda: ledger.renew(permit, lease=LEASE),
             lambda: ledger.release(permit),
         ]
@@ -372,7 +462,7 @@ async def test_a_grant_on_a_pool_with_no_row_at_another_version_is_a_conflict(en
     ledger = PostgresLedger(engine, HOUR)
     view = await ledger.view("p")
     stale = await ledger.grant(
-        "p", "1", version=5, lease=LEASE, fairness=view.fairness.after(view.waiting[0])
+        "p", view.waiting[0], version=5, lease=LEASE, fairness=view.fairness.after(view.waiting[0])
     )
     assert stale == Conflict()
 

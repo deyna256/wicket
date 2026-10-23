@@ -27,7 +27,7 @@ try:
         select,
         update,
     )
-    from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP
+    from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
     from sqlalchemy.dialects.postgresql import insert as upsert
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 except ModuleNotFoundError as error:
@@ -66,6 +66,7 @@ _tickets = Table(
     metadata,
     Column("pool", Text, primary_key=True),
     Column("id", Text, primary_key=True),
+    Column("submission_id", UUID, nullable=False, server_default=func.gen_random_uuid()),
     Column("tenant", Text, nullable=False),
     Column("traits", JSONB, nullable=False),
     Column("submitted_at", TIMESTAMP(timezone=True), nullable=False),
@@ -192,7 +193,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         )
 
     async def grant(
-        self, pool: str, ticket_id: str, *, version: Version, lease: timedelta, fairness: Fairness
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
         first = upsert(_pools).values(name=pool, version=1, fairness=msgspec.to_builtins(fairness))
         bump = first.on_conflict_do_update(
@@ -206,11 +207,12 @@ class PostgresLedger(msgspec.Struct, frozen=True):
                 await connection.rollback()
                 return Conflict()
             now = bumped.now.astimezone(UTC)
-            waiting = (
+            available = (
                 select(_tickets.c.id)
                 .where(
                     _tickets.c.pool == pool,
-                    _tickets.c.id == ticket_id,
+                    _tickets.c.id == waiting.ticket.id,
+                    _tickets.c.submission_id == waiting.submission_id,
                     or_(_tickets.c.lease_end.is_(None), _tickets.c.lease_end <= now),
                 )
                 # a ticket a caller's open transaction holds is skipped: Missing, not a wait
@@ -219,7 +221,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             )
             take = (
                 update(_tickets)
-                .where(_tickets.c.pool == pool, _tickets.c.id == waiting)
+                .where(_tickets.c.pool == pool, _tickets.c.id == available)
                 # the version this grant made is its permit's token
                 .values(
                     grants=_tickets.c.grants + 1,
@@ -290,4 +292,4 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         if isinstance(traits, dict):  # tickets written before traits became immutable values
             traits = [{"name": name, "value": value} for name, value in traits.items()]
         ticket = msgspec.convert({"id": row.id, "tenant": row.tenant, "traits": traits}, Ticket)
-        return Waiting(ticket, row.submitted_at.astimezone(UTC), row.grants)
+        return Waiting(ticket, row.submitted_at.astimezone(UTC), row.submission_id, row.grants)

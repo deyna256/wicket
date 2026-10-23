@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from typing import Protocol
 
+import msgspec
 import pytest
 from postgres_db import elapse, emptied
 from sqlalchemy import URL
@@ -27,7 +28,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.store import Backlog, Ledger
-from wicket.tickets import Permit, Ticket, Trait, Waiting
+from wicket.tickets import Permit, Ticket, Trait
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 LEASE = timedelta(seconds=30)
@@ -122,7 +123,7 @@ async def granted(store: Pair, ticket_id: str, pool: str = "p", lease: timedelta
     view = await store.ledger.view(pool)
     chosen = next(w for w in view.waiting if w.ticket.id == ticket_id)
     permit = await store.ledger.grant(
-        pool, ticket_id, version=view.version, lease=lease, fairness=view.fairness.after(chosen)
+        pool, chosen, version=view.version, lease=lease, fairness=view.fairness.after(chosen)
     )
     assert isinstance(permit, Permit)
     return permit
@@ -142,15 +143,70 @@ async def test_a_pool_nobody_used_is_empty_at_version_zero(store: Pair):
 async def test_a_submitted_ticket_waits_with_the_store_time(store: Pair):
     await store.backlog.submit("p", Ticket("1", "ann", (Trait("tier", 0.5),)))
     view = await store.ledger.view("p")
-    assert view.waiting == (Waiting(Ticket("1", "ann", (Trait("tier", 0.5),)), view.now, 0),)
+    (waiting,) = view.waiting
+    assert (waiting.ticket, waiting.submitted_at, waiting.grants) == (
+        Ticket("1", "ann", (Trait("tier", 0.5),)),
+        view.now,
+        0,
+    )
+    assert waiting.submission_id.version == 4
 
 
-async def test_submitting_a_known_id_keeps_the_first_tenant_and_traits(store: Pair):
+@pytest.mark.parametrize("leased", [False, True])
+async def test_submitting_a_known_id_changes_nothing(store: Pair, leased: bool):
     await store.backlog.submit("p", Ticket("1", "ann", (Trait("tier", 0.5),)))
+    if leased:
+        await granted(store, "1")
+    before = await store.ledger.view("p")
     await store.backlog.submit("p", Ticket("1", "bob", (Trait("tier", 1.0),)))
-    assert [w.ticket for w in (await store.ledger.view("p")).waiting] == [
-        Ticket("1", "ann", (Trait("tier", 0.5),))
-    ]
+    assert await store.ledger.view("p") == before
+
+
+@pytest.mark.parametrize("replacement", [Ticket("1", "bob"), Ticket("1", "ann")])
+@pytest.mark.parametrize("previous_grant", [False, True])
+async def test_a_stale_view_cannot_grant_a_replacement(
+    store: Pair, replacement: Ticket, previous_grant: bool
+):
+    if previous_grant:
+        await store.backlog.submit("p", Ticket("seed", "seed"))
+        await store.ledger.release(await granted(store, "seed"))
+    await store.backlog.submit("p", Ticket("1", "ann"))
+    stale = await store.ledger.view("p")
+    assert await store.backlog.withdraw("p", "1") == Withdrawn()
+    await store.backlog.submit("p", replacement)
+    before = await store.ledger.view("p")
+    assert before.waiting[0].submission_id != stale.waiting[0].submission_id
+
+    answer = await store.ledger.grant(
+        "p",
+        stale.waiting[0],
+        version=stale.version,
+        lease=LEASE,
+        fairness=stale.fairness.after(stale.waiting[0]),
+    )
+
+    assert answer == Missing()
+    assert await store.ledger.view("p") == before
+    permit = await granted(store, "1")
+    assert permit.waiting.ticket == replacement
+    assert (await store.ledger.view("p")).fairness == before.fairness.after(before.waiting[0])
+
+
+async def test_a_submission_from_another_pool_cannot_grant_an_equal_id(store: Pair):
+    for pool in ("a", "b"):
+        await store.backlog.submit(pool, Ticket("1", "ann"))
+    a, b = await store.ledger.view("a"), await store.ledger.view("b")
+    assert (
+        await store.ledger.grant(
+            "b",
+            a.waiting[0],
+            version=b.version,
+            lease=LEASE,
+            fairness=b.fairness.after(a.waiting[0]),
+        )
+        == Missing()
+    )
+    assert await store.ledger.view("b") == b
 
 
 async def test_input_traits_cannot_change_a_submitted_ticket(store: Pair):
@@ -200,8 +256,9 @@ async def test_a_grant_at_a_stale_version_is_a_conflict(store: Pair):
         await store.backlog.submit("p", Ticket(id, "ann"))
     stale = await store.ledger.view("p")
     await granted(store, "1")
+    chosen = next(w for w in stale.waiting if w.ticket.id == "2")
     answer = await store.ledger.grant(
-        "p", "2", version=stale.version, lease=LEASE, fairness=stale.fairness
+        "p", chosen, version=stale.version, lease=LEASE, fairness=stale.fairness
     )
     assert answer == Conflict()
 
@@ -212,9 +269,7 @@ async def test_concurrent_grants_at_one_version_lease_one_ticket(store: Pair):
     view = await store.ledger.view("p")
     answers = await asyncio.gather(
         *(
-            store.ledger.grant(
-                "p", w.ticket.id, version=view.version, lease=LEASE, fairness=view.fairness
-            )
+            store.ledger.grant("p", w, version=view.version, lease=LEASE, fairness=view.fairness)
             for w in view.waiting
         )
     )
@@ -227,7 +282,7 @@ async def test_a_grant_of_a_leased_ticket_at_the_current_version_is_missing(stor
     await granted(store, "1")
     view = await store.ledger.view("p")
     answer = await store.ledger.grant(
-        "p", "1", version=view.version, lease=LEASE, fairness=view.fairness
+        "p", view.leased[0].waiting, version=view.version, lease=LEASE, fairness=view.fairness
     )
     assert answer == Missing()
 
@@ -236,10 +291,13 @@ async def test_a_grant_of_a_withdrawn_or_unknown_ticket_is_missing(store: Pair):
     await store.backlog.submit("p", Ticket("1", "ann"))
     view = await store.ledger.view("p")
     await store.backlog.withdraw("p", "1")
-    for id in ("1", "nobody"):
+    for waiting in (
+        view.waiting[0],
+        msgspec.structs.replace(view.waiting[0], ticket=Ticket("nobody", "ann")),
+    ):
         assert (
             await store.ledger.grant(
-                "p", id, version=view.version, lease=LEASE, fairness=view.fairness
+                "p", waiting, version=view.version, lease=LEASE, fairness=view.fairness
             )
             == Missing()
         )
@@ -269,12 +327,15 @@ async def test_an_expired_lease_puts_the_ticket_back_with_its_grants_and_submit_
     store: Pair,
 ):
     await store.backlog.submit("p", Ticket("1", "ann"))
-    submitted = (await store.ledger.view("p")).waiting[0].submitted_at
+    submitted = (await store.ledger.view("p")).waiting[0]
     permit = await granted(store, "1")
     await store.elapse(LEASE)
     view = await store.ledger.view("p")
-    assert view.leased == () and view.waiting == (Waiting(Ticket("1", "ann"), submitted, 1),)
+    assert view.leased == () and view.waiting == (msgspec.structs.replace(submitted, grants=1),)
     assert await store.ledger.renew(permit, lease=LEASE) == LeaseLost()
+    redelivered = await granted(store, "1")
+    assert redelivered.waiting.submission_id == submitted.submission_id
+    assert redelivered.attempt == 2
 
 
 async def test_a_release_after_the_lease_ends_succeeds_until_the_ticket_is_leased_again(
@@ -309,9 +370,12 @@ async def test_withdraw_answers_by_the_state_of_the_ticket(store: Pair):
 
 async def test_a_ticket_submitted_again_after_it_is_gone_starts_anew(store: Pair):
     await store.backlog.submit("p", Ticket("1", "ann"))
-    assert await store.ledger.release(await granted(store, "1")) == Released()
+    permit = await granted(store, "1")
+    assert await store.ledger.release(permit) == Released()
     await store.backlog.submit("p", Ticket("1", "ann"))
-    assert (await store.ledger.view("p")).waiting[0].grants == 0
+    waiting = (await store.ledger.view("p")).waiting[0]
+    assert waiting.grants == 0
+    assert waiting.submission_id != permit.waiting.submission_id
 
 
 async def test_two_pools_keep_equal_ids_and_tokens_apart(store: Pair):
