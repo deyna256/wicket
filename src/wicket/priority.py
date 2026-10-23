@@ -1,6 +1,6 @@
 """How important each waiting ticket is, and the choice of the most important."""
 
-import math
+import sys
 from collections.abc import Mapping
 from datetime import timedelta
 from typing import Protocol
@@ -54,17 +54,21 @@ class Trait(msgspec.Struct, frozen=True):
 
 class Priority:
     """Weighted factors, and the choice of the ticket with the highest weighted sum; ties go to the
-    earlier submitted, then the smaller id. No factors is first in, first out. A plain class, since
-    a Struct cannot take its factors as arguments; it never changes after construction."""
+    earlier submitted, then the smaller id. Weights are non-negative and their sum must fit in a
+    finite float. No factors is first in, first out. A plain class, since a Struct cannot take its
+    factors as arguments; it never changes after construction."""
 
     __slots__ = ("_factors",)
 
     def __init__(self, *factors: tuple[Factor, float]) -> None:
         for factor, weight in factors:
-            if not 0 <= weight < math.inf:
+            if not 0 <= weight <= sys.float_info.max:
                 raise ValueError(
-                    f"the weight of {factor!r} is {weight}; weights are finite and not negative"
+                    f"the weight of {factor!r} is {weight}; "
+                    "weights must fit in a finite non-negative float"
                 )
+        if sum((weight for _, weight in factors), 0.0) > sys.float_info.max:
+            raise ValueError("the sum of priority weights must fit in a finite float")
         self._factors = factors
 
     def first(self, view: PoolView) -> Waiting | NoTicket:

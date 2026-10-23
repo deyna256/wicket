@@ -3,6 +3,7 @@ choice of the highest priority."""
 
 import math
 import random
+import sys
 from datetime import UTC, datetime, timedelta
 
 import msgspec
@@ -112,6 +113,30 @@ def test_an_empty_priority_grants_in_submission_order():
     assert order == ["a", "b", "b"]
 
 
+@pytest.mark.parametrize(
+    "weights",
+    [(1e308, 1e308), (10**308, 10**308), (10**308, 10**308, 0.0)],
+    ids=["floats", "integers", "mixed"],
+)
+def test_priority_refuses_weights_whose_sum_overflows(weights: tuple[float, ...]):
+    with pytest.raises(ValueError, match="sum of priority weights"):
+        Priority(*((Trait("tier"), weight) for weight in weights))
+
+
+@pytest.mark.parametrize(
+    ("weight", "expected"),
+    [(0.0, ["a", "b"]), (1.0, ["b", "a"]), (sys.float_info.max / 2, ["b", "a"])],
+)
+def test_finite_weight_sums_preserve_priority_and_zero_weight_fifo(
+    weight: float, expected: list[str]
+):
+    order, _ = drain(
+        Priority((Trait("tier"), weight), (Trait("tier"), weight)),
+        [ticket("old", "a", tier=0.9), ticket("new", "b", at=1, tier=1.0)],
+    )
+    assert order == expected
+
+
 def test_a_deciding_trait_puts_the_higher_tier_first():
     paid = Priority((Trait("tier"), 10), (FairShare(), 4), (Age(full_after=HOUR), 1))
     order, _ = drain(paid, tickets("free", 3, tier=0.0) + tickets("paid", 3, 100, tier=1.0))
@@ -175,7 +200,7 @@ def test_nothing_waiting_is_no_ticket():
 def test_a_negative_weight_or_a_full_after_of_zero_is_refused():
     with pytest.raises(ValueError, match="weight"):
         Priority((FairShare(), -1))
-    for weight in (math.nan, math.inf):
+    for weight in (math.nan, math.inf, 10**400):
         with pytest.raises(ValueError, match="finite"):
             Priority((FairShare(), weight))
     with pytest.raises(ValueError, match="full_after"):
