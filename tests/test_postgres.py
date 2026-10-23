@@ -24,7 +24,7 @@ from wicket.limits import Concurrency, Rate
 from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.priority import FairShare, Priority
-from wicket.results import Conflict, Missing, Renewed, StoreUnavailable, Withdrawn
+from wicket.results import Conflict, LeaseLost, Missing, Renewed, StoreUnavailable, Withdrawn
 from wicket.tickets import Permit, Ticket, Trait, Waiting
 
 pytestmark = pytest.mark.postgres
@@ -369,6 +369,91 @@ async def test_a_renewal_keeps_its_seconds_across_a_daylight_saving_change(url: 
         assert await ledger.renew(permit, lease=timedelta(days=1)) == Renewed()
         await elapse(engine, timedelta(hours=23, minutes=30))
         assert len((await ledger.view("p")).leased) == 1
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["commit", "cancel"])
+async def test_a_delayed_renewal_cannot_revive_capacity_used_by_another_grant(
+    engine: AsyncEngine, url: URL, cancel: bool
+):
+    await submit(engine, "1", "2")
+    ledger = PostgresLedger(engine, HOUR)
+    permit = await grant_first(ledger)
+    assert isinstance(permit, Permit)
+    await elapse(engine, timedelta(seconds=29))
+    updated, resume = asyncio.Event(), asyncio.Event()
+
+    def pause_after_update(connection: Any, cursor: Any, statement: str, *args: Any) -> None:
+        if statement.lstrip().startswith("UPDATE wicket_tickets"):
+            updated.set()
+            await_(resume.wait())
+
+    async with opened(url) as renewal_engine:
+        renewer = PostgresLedger(renewal_engine, HOUR)
+        event.listen(renewal_engine.sync_engine, "after_cursor_execute", pause_after_update)
+        try:
+            async with asyncio.TaskGroup() as tasks:
+                renewal = tasks.create_task(renewer.renew(permit, lease=LEASE))
+                try:
+                    await updated.wait()
+                    await elapse(engine, timedelta(seconds=2))
+                    stale = await ledger.view("p")
+                    assert Concurrency(1).admits(stale)
+                    chosen = next(
+                        w for w in stale.waiting if w.ticket.id != permit.waiting.ticket.id
+                    )
+                    grant = tasks.create_task(
+                        ledger.grant(
+                            "p",
+                            chosen,
+                            version=stale.version,
+                            lease=LEASE,
+                            fairness=stale.fairness.after(chosen),
+                        )
+                    )
+                    blocked = tasks.create_task(
+                        until(url, f"exists (select {OTHERS} and wait_event_type = 'Lock')")
+                    )
+                    # The old implementation grants immediately; the fixed one waits for renewal.
+                    await asyncio.wait((grant, blocked), return_when=asyncio.FIRST_COMPLETED)
+                    blocked.cancel()
+                    if cancel:
+                        renewal.cancel()
+                finally:
+                    resume.set()
+        finally:
+            event.remove(renewal_engine.sync_engine, "after_cursor_execute", pause_after_update)
+        assert given_back(renewal_engine)
+
+    fresh = await ledger.view("p")
+    if cancel:
+        assert renewal.cancelled()
+        answer = grant.result()
+        assert isinstance(answer, Permit)
+        assert fresh.leased == (answer,)
+        assert fresh.version == stale.version + 1
+    else:
+        assert renewal.result() == Renewed()
+        assert grant.result() == Conflict()
+        assert fresh == msgspec.structs.replace(
+            stale, version=stale.version + 1, waiting=(chosen,), leased=(permit,)
+        )
+    assert not Concurrency(1).admits(fresh)
+
+
+async def test_a_renewal_checks_expiry_after_waiting_for_the_pool(engine: AsyncEngine, url: URL):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    permit = await grant_first(ledger)
+    assert isinstance(permit, Permit)
+    await elapse(engine, timedelta(seconds=29))
+    async with asyncio.TaskGroup() as tasks, engine.begin() as connection:
+        await connection.execute(text("select name from wicket_pools where name = 'p' for update"))
+        renewal = tasks.create_task(ledger.renew(permit, lease=LEASE))
+        await until(url, f"exists (select {OTHERS} and wait_event_type = 'Lock')")
+        await elapse(engine, timedelta(seconds=2))
+        expired = await ledger.view("p")
+    assert renewal.result() == LeaseLost()
+    assert await ledger.view("p") == expired
 
 
 async def test_grant_times_come_back_in_order_after_old_ones_are_deleted(url: URL):

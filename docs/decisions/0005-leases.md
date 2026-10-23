@@ -24,7 +24,9 @@ worker that wakes up must not overwrite the result of the worker that took the t
   already waiting again, which no limit counts. After a re-grant or a withdrawal it answers `LeaseLost` and
   nothing is raised.
 - **The token is the pool's version after the grant,** increasing within the pool. The caller stores
-  it with its row and rejects a write that carries an older one.
+  it with its row and rejects a write that carries an older one. Renewal keeps this token while
+  advancing the pool's version ([decision 2](0002-pure-decision-over-a-store.md)), so tokens may
+  have gaps and the original permit remains valid for renewal and release.
 - **When to give up is the caller's,** from `permit.attempt` or the error: it records the failure in
   its own row and ends the block normally.
 

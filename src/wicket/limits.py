@@ -1,5 +1,5 @@
-"""Whether a pool may lease one more ticket now. A limit's answer may turn from refuse to admit
-without a grant, never the reverse, so it reads only what grants change and the retention."""
+"""Whether a pool may lease one more ticket now. At the same version a limit may turn from refuse
+to admit, never the reverse; it reads only leased tickets, grant times, now and retention."""
 
 from datetime import timedelta
 from typing import Protocol

@@ -16,7 +16,7 @@ class Gone(msgspec.Struct, frozen=True):
 
 
 class Conflict(msgspec.Struct, frozen=True):
-    """Another grant came first: the view's version is stale."""
+    """A grant or renewal changed the pool: the view's version is stale."""
 
 
 class Missing(msgspec.Struct, frozen=True):

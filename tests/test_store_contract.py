@@ -304,14 +304,52 @@ async def test_a_grant_of_a_withdrawn_or_unknown_ticket_is_missing(store: Pair):
     assert (await store.ledger.view("p")).version == view.version
 
 
-async def test_only_a_grant_changes_the_version(store: Pair):
+async def test_backlog_changes_and_release_keep_the_version(store: Pair):
     await store.backlog.submit("p", Ticket("1", "ann"))
-    await store.backlog.submit("p", Ticket("2", "ann"))
     permit = await granted(store, "1")
-    assert await store.ledger.renew(permit, lease=LEASE) == Renewed()
+    await store.backlog.submit("p", Ticket("2", "ann"))
+    assert (await store.ledger.view("p")).version == permit.token
     await store.backlog.withdraw("p", "2")
+    assert (await store.ledger.view("p")).version == permit.token
     assert await store.ledger.release(permit) == Released()
-    assert (await store.ledger.view("p")).version == 1
+    assert (await store.ledger.view("p")).version == permit.token
+
+
+async def test_a_renewal_invalidates_a_view_without_changing_the_permit_or_grant_state(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann"))
+    await store.backlog.submit("p", Ticket("2", "bob"))
+    permit = await granted(store, "1")
+    await store.elapse(timedelta(seconds=10))
+    stale = await store.ledger.view("p")
+    assert await store.ledger.renew(permit, lease=LEASE) == Renewed()
+    renewed = await store.ledger.view("p")
+    assert renewed == msgspec.structs.replace(stale, version=stale.version + 1)
+    chosen = stale.waiting[0]
+    assert (
+        await store.ledger.grant(
+            "p", chosen, version=stale.version, lease=LEASE, fairness=stale.fairness.after(chosen)
+        )
+        == Conflict()
+    )
+    assert await store.ledger.view("p") == renewed
+    assert await store.ledger.renew(permit, lease=LEASE) == Renewed()
+    assert await store.ledger.release(permit) == Released()
+    next_permit = await granted(store, "2")
+    assert next_permit.token == permit.token + 3
+
+
+@pytest.mark.parametrize("missing", ["token", "pool"])
+async def test_a_renewal_of_an_unknown_permit_changes_nothing(store: Pair, missing: str):
+    await store.backlog.submit("p", Ticket("1", "ann"))
+    permit = await granted(store, "1")
+    unknown = (
+        msgspec.structs.replace(permit, token=permit.token + 1)
+        if missing == "token"
+        else msgspec.structs.replace(permit, pool="unknown")
+    )
+    before = await store.ledger.view(unknown.pool)
+    assert await store.ledger.renew(unknown, lease=LEASE) == LeaseLost()
+    assert await store.ledger.view(unknown.pool) == before
 
 
 async def test_a_renewal_extends_the_lease(store: Pair):
@@ -333,6 +371,7 @@ async def test_an_expired_lease_puts_the_ticket_back_with_its_grants_and_submit_
     view = await store.ledger.view("p")
     assert view.leased == () and view.waiting == (msgspec.structs.replace(submitted, grants=1),)
     assert await store.ledger.renew(permit, lease=LEASE) == LeaseLost()
+    assert await store.ledger.view("p") == view
     redelivered = await granted(store, "1")
     assert redelivered.waiting.submission_id == submitted.submission_id
     assert redelivered.attempt == 2
@@ -384,9 +423,13 @@ async def test_two_pools_keep_equal_ids_and_tokens_apart(store: Pair):
     in_a, in_b = await granted(store, "1", "a"), await granted(store, "1", "b")
     assert in_a.token == in_b.token == 1
     assert await store.ledger.release(in_a) == Released()
+    a, b = await store.ledger.view("a"), await store.ledger.view("b")
     assert await store.ledger.renew(in_a, lease=LEASE) == LeaseLost()
+    assert await store.ledger.view("a") == a
+    assert await store.ledger.view("b") == b
     assert await store.ledger.renew(in_b, lease=LEASE) == Renewed()
-    assert (await store.ledger.view("b")).leased == (in_b,)
+    assert await store.ledger.view("a") == a
+    assert await store.ledger.view("b") == msgspec.structs.replace(b, version=b.version + 1)
 
 
 async def test_the_view_reports_the_retention_and_the_grants_within_it(store: Pair):

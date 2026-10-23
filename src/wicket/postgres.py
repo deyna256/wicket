@@ -245,6 +245,12 @@ class PostgresLedger(msgspec.Struct, frozen=True):
 
     async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost:
         async with self._connection(_COMMITTED) as connection:
+            # Lock the pool before checking expiry, so a delayed renewal invalidates stale grants.
+            await connection.execute(
+                update(_pools)
+                .where(_pools.c.name == permit.pool)
+                .values(version=_pools.c.version + 1)
+            )
             renewed = await connection.execute(
                 update(_tickets)
                 .where(
@@ -255,8 +261,11 @@ class PostgresLedger(msgspec.Struct, frozen=True):
                 )
                 .values(lease_end=func.clock_timestamp() + self._seconds(lease))
             )
+            if renewed.rowcount != 1:
+                await connection.rollback()
+                return LeaseLost()
             await connection.commit()
-        return Renewed() if renewed.rowcount == 1 else LeaseLost()
+        return Renewed()
 
     async def release(self, permit: Permit) -> Released | LeaseLost:
         async with self._connection(_COMMITTED) as connection:

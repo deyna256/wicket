@@ -28,6 +28,11 @@ is usually SQLAlchemy.
 - **Submission identity is a UUID column with `gen_random_uuid()` as its default.** A grant matches
   it while locking the chosen ticket with `SKIP LOCKED`; withdrawals need no pool-row lock
   ([decision 2](0002-pure-decision-over-a-store.md)).
+- **Grant and renewal lock the pool before its ticket.** Renewal increments the existing pool
+  version in `READ COMMITTED`, then checks the token and expiry against `clock_timestamp()`
+  and updates the lease. It commits both changes together or rolls back if the lease is lost.
+  A grant using a view that missed the renewal waits for it and returns `Conflict` if it commits.
+  PostgreSQL [rechecks the update condition after a concurrent writer commits](https://www.postgresql.org/docs/current/transaction-iso.html#XACT-READ-COMMITTED).
 
 ## Alternatives
 
@@ -46,6 +51,8 @@ is usually SQLAlchemy.
 - A caller without SQLAlchemy writes its own adapter of the two ports and runs the store contract
   on it.
 - Every process serving a pool passes the same `retention`.
+- Upgrade all workers sharing a pool to enforce renewal/version atomicity, including custom
+  ledgers. This change needs no schema migration; old renewers can still bypass the guarantee.
 - Upgrade every process sharing a pool before writing the new trait format: 0.1.0 readers cannot
   read the arrays. Existing rows need no migration; the JSONB column's type stays the same.
 - The PostgreSQL tests need a database: a server URL or Docker; CI runs them on Ubuntu.

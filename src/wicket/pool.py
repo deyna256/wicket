@@ -87,7 +87,7 @@ class Pool:
                 case (Permit() as permit, float() as since):
                     return permit, since
                 case Conflict():
-                    continue  # another grant came first: read again at once
+                    continue  # a grant or renewal changed the version: read again at once
                 case NoTicket():
                     await asyncio.sleep(random.uniform(self._poll / 2, self._poll))
 

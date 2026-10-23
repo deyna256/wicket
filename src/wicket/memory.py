@@ -127,6 +127,7 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         if not (held.holds(permit) and held.leased(id, now)):
             return LeaseLost()
         held.leases[id] = _Lease(held.leases[id].permit, now + lease)
+        held.version += 1
         return Renewed()
 
     async def release(self, permit: Permit) -> Released | LeaseLost:
