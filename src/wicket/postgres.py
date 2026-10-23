@@ -122,7 +122,7 @@ class PostgresBacklog(msgspec.Struct, frozen=True):
                     pool=pool,
                     id=ticket.id,
                     tenant=ticket.tenant,
-                    traits=dict(ticket.traits),
+                    traits=msgspec.to_builtins(ticket.traits),
                     submitted_at=func.clock_timestamp(),
                     grants=0,
                 )
@@ -286,5 +286,8 @@ class PostgresLedger(msgspec.Struct, frozen=True):
 
     def _waiting(self, row: Row[*tuple[Any, ...]]) -> Waiting:
         """A ticket read back through Ticket's own checks, at UTC whatever the session's zone."""
-        ticket = msgspec.convert({"id": row.id, "tenant": row.tenant, "traits": row.traits}, Ticket)
+        traits = row.traits
+        if isinstance(traits, dict):  # tickets written before traits became immutable values
+            traits = [{"name": name, "value": value} for name, value in traits.items()]
+        ticket = msgspec.convert({"id": row.id, "tenant": row.tenant, "traits": traits}, Ticket)
         return Waiting(ticket, row.submitted_at.astimezone(UTC), row.grants)

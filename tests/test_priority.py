@@ -10,14 +10,16 @@ import msgspec
 import pytest
 
 from wicket.fairness import Fairness
-from wicket.priority import Age, FairShare, Priority, Trait
+from wicket.priority import Age, FairShare, Priority, TraitFactor
 from wicket.results import NoTicket
-from wicket.tickets import Ticket, Waiting
+from wicket.tickets import Ticket, Trait, Waiting
 from wicket.view import PoolView
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 HOUR = timedelta(hours=1)
-FAIR = Priority((FairShare(), 4), (Trait("tier"), 2), (Age(full_after=timedelta(minutes=30)), 1))
+FAIR = Priority(
+    (FairShare(), 4), (TraitFactor("tier"), 2), (Age(full_after=timedelta(minutes=30)), 1)
+)
 
 
 START = Fairness()
@@ -27,7 +29,7 @@ def ticket(
     id: str, tenant: str, at: float = 0, grants: int = 0, tier: float | None = None
 ) -> Waiting:
     """A waiting ticket submitted `at` seconds after EPOCH, with a tier if one is given."""
-    traits = {} if tier is None else {"tier": tier}
+    traits = () if tier is None else (Trait("tier", tier),)
     return Waiting(Ticket(id, tenant, traits), EPOCH + timedelta(seconds=at), grants)
 
 
@@ -120,7 +122,7 @@ def test_an_empty_priority_grants_in_submission_order():
 )
 def test_priority_refuses_weights_whose_sum_overflows(weights: tuple[float, ...]):
     with pytest.raises(ValueError, match="sum of priority weights"):
-        Priority(*((Trait("tier"), weight) for weight in weights))
+        Priority(*((TraitFactor("tier"), weight) for weight in weights))
 
 
 @pytest.mark.parametrize(
@@ -131,20 +133,20 @@ def test_finite_weight_sums_preserve_priority_and_zero_weight_fifo(
     weight: float, expected: list[str]
 ):
     order, _ = drain(
-        Priority((Trait("tier"), weight), (Trait("tier"), weight)),
+        Priority((TraitFactor("tier"), weight), (TraitFactor("tier"), weight)),
         [ticket("old", "a", tier=0.9), ticket("new", "b", at=1, tier=1.0)],
     )
     assert order == expected
 
 
 def test_a_deciding_trait_puts_the_higher_tier_first():
-    paid = Priority((Trait("tier"), 10), (FairShare(), 4), (Age(full_after=HOUR), 1))
+    paid = Priority((TraitFactor("tier"), 10), (FairShare(), 4), (Age(full_after=HOUR), 1))
     order, _ = drain(paid, tickets("free", 3, tier=0.0) + tickets("paid", 3, 100, tier=1.0))
     assert order == ["paid"] * 3 + ["free"] * 3
 
 
 def test_a_deciding_trait_with_three_tiers_orders_them():
-    paid = Priority((Trait("tier"), 20), (FairShare(), 4), (Age(full_after=HOUR), 1))
+    paid = Priority((TraitFactor("tier"), 20), (FairShare(), 4), (Age(full_after=HOUR), 1))
     waiting = (
         tickets("low", 2, tier=0.0)
         + tickets("mid", 2, 10, tier=0.5)
@@ -155,7 +157,7 @@ def test_a_deciding_trait_with_three_tiers_orders_them():
 
 
 def test_the_tenants_of_the_top_tier_take_turns():
-    paid = Priority((Trait("tier"), 10), (FairShare(), 4), (Age(full_after=HOUR), 1))
+    paid = Priority((TraitFactor("tier"), 10), (FairShare(), 4), (Age(full_after=HOUR), 1))
     waiting = tickets("p", 4, tier=1.0) + tickets("q", 4, 10, tier=1.0) + tickets("free", 2, 20)
     order, _ = drain(paid, waiting)
     assert order == ["p", "q"] * 4 + ["free", "free"]
@@ -179,7 +181,17 @@ def test_a_ticket_without_the_trait_scores_zero():
     view = PoolView(
         now=EPOCH, retention=HOUR, waiting=(ticket("1", "a", tier=0.5), ticket("2", "a"))
     )
-    assert Trait("tier").scores(view) == {"1": 0.5, "2": 0.0}
+    assert TraitFactor("tier").scores(view) == {"1": 0.5, "2": 0.0}
+
+
+def test_a_trait_factor_reads_its_named_trait_among_other_traits():
+    view = PoolView(
+        now=EPOCH,
+        retention=HOUR,
+        waiting=(Waiting(Ticket("1", "a", (Trait("urgent", 1.0), Trait("tier", 0.5))), EPOCH),),
+    )
+    assert TraitFactor("tier").scores(view) == {"1": 0.5}
+    assert TraitFactor("missing").scores(view) == {"1": 0.0}
 
 
 def test_fair_share_scores_one_for_the_tenants_whose_turn_it_is():

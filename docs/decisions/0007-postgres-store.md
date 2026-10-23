@@ -21,6 +21,8 @@ is usually SQLAlchemy.
   connection from the engine. The driver is the caller's, through its URL: asyncpg or psycopg.
 - **The tables are `MetaData` for the caller's migrations**, named `wicket_pools`,
   `wicket_tickets` and `wicket_grants`. wicket ships no migrations and creates no tables.
+- **Traits are a JSONB array of name/value records**, preserving their tuple order. The reader also
+  accepts the name-to-number objects written by 0.1.0 and validates both formats through `Ticket`.
 - **The store's clock only**: a view reads `now()`, every other call `clock_timestamp()`, and times
   are read back as UTC.
 
@@ -41,4 +43,6 @@ is usually SQLAlchemy.
 - A caller without SQLAlchemy writes its own adapter of the two ports and runs the store contract
   on it.
 - Every process serving a pool passes the same `retention`.
+- Upgrade every process sharing a pool before writing the new trait format: 0.1.0 readers cannot
+  read the arrays. Existing rows need no migration; the JSONB column's type stays the same.
 - The PostgreSQL tests need a database: a server URL or Docker; CI runs them on Ubuntu.

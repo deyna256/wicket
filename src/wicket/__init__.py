@@ -4,7 +4,7 @@ from wicket.fairness import Fairness
 from wicket.limits import Concurrency, Limit, Rate
 from wicket.memory import MemoryBacklog, MemoryLedger, MemoryState
 from wicket.pool import Pool
-from wicket.priority import Age, Factor, FairShare, Priority, Trait
+from wicket.priority import Age, Factor, FairShare, Priority, TraitFactor
 from wicket.results import (
     AlreadyLeased,
     Conflict,
@@ -19,7 +19,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.store import Backlog, Ledger
-from wicket.tickets import Permit, Ticket, Version, Waiting
+from wicket.tickets import Permit, Ticket, Trait, Version, Waiting
 from wicket.view import PoolView
 
 __all__ = [
@@ -51,6 +51,7 @@ __all__ = [
     "StoreUnavailable",
     "Ticket",
     "Trait",
+    "TraitFactor",
     "Version",
     "Waiting",
     "Withdrawn",

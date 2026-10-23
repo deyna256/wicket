@@ -16,8 +16,17 @@ def test_every_public_name_exists():
 
 
 def test_the_names_a_caller_needs_are_public():
-    names = {"Ticket", "Waiting", "Permit", "Version", "PoolView", "Fairness"}
-    names |= {"Factor", "FairShare", "Age", "Trait", "Priority", "Limit", "Concurrency", "Rate"}
+    names = {"Ticket", "Trait", "Waiting", "Permit", "Version", "PoolView", "Fairness"}
+    names |= {
+        "Factor",
+        "FairShare",
+        "Age",
+        "TraitFactor",
+        "Priority",
+        "Limit",
+        "Concurrency",
+        "Rate",
+    }
     names |= {"Backlog", "Ledger", "MemoryState", "MemoryBacklog", "MemoryLedger", "Pool"}
     names |= {"Withdrawn", "AlreadyLeased", "Gone", "Conflict", "Missing", "Renewed", "Released"}
     names |= {"LeaseLost", "NoTicket", "LeaseLostError", "StoreUnavailable"}

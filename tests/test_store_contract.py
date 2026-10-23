@@ -27,7 +27,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.store import Backlog, Ledger
-from wicket.tickets import Permit, Ticket, Waiting
+from wicket.tickets import Permit, Ticket, Trait, Waiting
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 LEASE = timedelta(seconds=30)
@@ -140,24 +140,47 @@ async def test_a_pool_nobody_used_is_empty_at_version_zero(store: Pair):
 
 
 async def test_a_submitted_ticket_waits_with_the_store_time(store: Pair):
-    await store.backlog.submit("p", Ticket("1", "ann", {"tier": 0.5}))
+    await store.backlog.submit("p", Ticket("1", "ann", (Trait("tier", 0.5),)))
     view = await store.ledger.view("p")
-    assert view.waiting == (Waiting(Ticket("1", "ann", {"tier": 0.5}), view.now, 0),)
+    assert view.waiting == (Waiting(Ticket("1", "ann", (Trait("tier", 0.5),)), view.now, 0),)
 
 
 async def test_submitting_a_known_id_keeps_the_first_tenant_and_traits(store: Pair):
-    await store.backlog.submit("p", Ticket("1", "ann", {"tier": 0.5}))
-    await store.backlog.submit("p", Ticket("1", "bob", {"tier": 1.0}))
+    await store.backlog.submit("p", Ticket("1", "ann", (Trait("tier", 0.5),)))
+    await store.backlog.submit("p", Ticket("1", "bob", (Trait("tier", 1.0),)))
     assert [w.ticket for w in (await store.ledger.view("p")).waiting] == [
-        Ticket("1", "ann", {"tier": 0.5})
+        Ticket("1", "ann", (Trait("tier", 0.5),))
     ]
 
 
-async def test_the_store_keeps_its_own_copy_of_the_traits(store: Pair):
-    traits = {"tier": 0.5}
+async def test_input_traits_cannot_change_a_submitted_ticket(store: Pair):
+    trait = Trait("tier", 0.5)
+    ticket = Ticket("1", "ann", (trait,))
+    with pytest.raises(AttributeError):
+        trait.value = 99.0  # ty: ignore[invalid-assignment]
+    await store.backlog.submit("p", ticket)
+    with pytest.raises(AttributeError):
+        trait.value = 9.0  # ty: ignore[invalid-assignment]
+    assert (await store.ledger.view("p")).waiting[0].ticket == ticket
+
+
+@pytest.mark.parametrize("source", ["waiting", "grant", "leased"])
+async def test_views_and_permits_cannot_change_ticket_traits(store: Pair, source: str):
+    traits = (Trait("urgent", 1.0), Trait("tier", 0.5))
     await store.backlog.submit("p", Ticket("1", "ann", traits))
-    traits["tier"] = 9.0
-    assert (await store.ledger.view("p")).waiting[0].ticket.traits == {"tier": 0.5}
+    waiting = (await store.ledger.view("p")).waiting[0].ticket
+    permit = await granted(store, "1")
+    leased = (await store.ledger.view("p")).leased[0].waiting.ticket
+    ticket = {"waiting": waiting, "grant": permit.waiting.ticket, "leased": leased}[source]
+
+    with pytest.raises(AttributeError):
+        ticket.traits[0].value = 99.0  # ty: ignore[invalid-assignment]
+    with pytest.raises(AttributeError):
+        ticket.traits = (Trait("tier", 1.0),)  # ty: ignore[invalid-assignment]
+
+    assert (await store.ledger.view("p")).leased[0].waiting.ticket.traits == traits
+    await store.elapse(LEASE)
+    assert (await store.ledger.view("p")).waiting[0].ticket.traits == traits
 
 
 async def test_a_grant_leases_the_ticket_and_writes_its_time_fairness_and_version(

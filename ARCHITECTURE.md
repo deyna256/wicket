@@ -28,10 +28,10 @@ All code is in `src/wicket/`.
 | module | what is there |
 |---|---|
 | `results.py` | the result values `Withdrawn`, `AlreadyLeased`, `Gone`, `Conflict`, `Missing`, `Renewed`, `Released`, `LeaseLost`, `NoTicket`; the errors `LeaseLostError` and `StoreUnavailable` |
-| `tickets.py` | `Version`, `Ticket`, which checks its traits, `Waiting`, `Permit` |
+| `tickets.py` | `Version`, `Trait`, which checks its value, `Ticket`, `Waiting`, `Permit` |
 | `fairness.py` | `Fairness`, Start-time Fair Queuing with every ticket weighing one |
 | `view.py` | `PoolView`, the snapshot every decision reads |
-| `priority.py` | the contract `Factor`; `FairShare`, `Age`, `Trait`; `Priority` |
+| `priority.py` | the contract `Factor`; `FairShare`, `Age`, `TraitFactor`; `Priority` |
 | `limits.py` | the contract `Limit`; `Concurrency`, `Rate` |
 | `store.py` | the ports `Backlog` and `Ledger` |
 | `memory.py` | the in-memory store: `MemoryState` and its two adapters `MemoryBacklog` and `MemoryLedger` |
@@ -75,12 +75,13 @@ in all of `src/wicket/`.
 10. **Types are checked on data, never on behaviour.** `match` reads the closed unions of results;
     objects with behaviour are called through their interface.
 11. **Nothing of the caller's type passes through.** A ticket carries its importance as named numbers
-    in `0..1`, its `traits`, which `Ticket` checks where it is built or decoded; the work itself stays
-    in the caller's row. So no class has a type parameter.
+    in `0..1`: immutable `Trait` values in a tuple, with unique names. `Trait` checks its value and
+    `Ticket` checks its collection where each is built or decoded; the work itself stays in the
+    caller's row. So no class has a type parameter.
 
 **Where wicket departs from *Elegant Objects*:**
 
-- **Data has public fields.** `Ticket`, `Waiting`, `Permit` and `PoolView` are immutable records with
+- **Data has public fields.** `Trait`, `Ticket`, `Waiting`, `Permit` and `PoolView` are immutable records with
   public fields; accessor methods would be noise in Python.
 - **A permit is held with `async with`**, Python's usual "take, use, give back".
 - **Three plain classes.** `Priority` takes its factors as arguments, which a `Struct` cannot, and

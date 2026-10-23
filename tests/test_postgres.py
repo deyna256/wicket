@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+import msgspec
 import pytest
 from postgres_db import elapse, emptied, given_back, opened
 from sqlalchemy import URL, event, make_url, text
@@ -23,7 +24,7 @@ from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.priority import FairShare, Priority
 from wicket.results import Conflict, Missing, Renewed, StoreUnavailable
-from wicket.tickets import Permit, Ticket, Waiting
+from wicket.tickets import Permit, Ticket, Trait, Waiting
 
 pytestmark = pytest.mark.postgres
 
@@ -111,6 +112,33 @@ async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(en
         )
         assert held == Missing()
         assert isinstance(next_one, Permit)
+
+
+async def test_traits_written_as_a_dictionary_still_read_as_immutable_values(engine: AsyncEngine):
+    await submit(engine, "1")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("update wicket_tickets set traits = cast(:traits as jsonb)"),
+            {"traits": '{"tier": 0.5}'},
+        )
+    ledger = PostgresLedger(engine, HOUR)
+    assert (await ledger.view("p")).waiting[0].ticket.traits == (Trait("tier", 0.5),)
+    permit = await grant_first(ledger)
+    assert isinstance(permit, Permit)
+    assert permit.waiting.ticket.traits == (Trait("tier", 0.5),)
+    with pytest.raises(AttributeError):
+        permit.waiting.ticket.traits[0].value = 99.0  # ty: ignore[invalid-assignment]
+
+
+@pytest.mark.parametrize("traits", ['{"tier": 99}', '[{"name": "tier", "value": 99}]'])
+async def test_invalid_stored_traits_are_rejected_in_both_formats(engine: AsyncEngine, traits: str):
+    await submit(engine, "1")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("update wicket_tickets set traits = cast(:traits as jsonb)"), {"traits": traits}
+        )
+    with pytest.raises(msgspec.ValidationError, match=r"not in 0\.\.1"):
+        await PostgresLedger(engine, HOUR).view("p")
 
 
 @pytest.mark.parametrize(

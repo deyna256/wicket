@@ -43,13 +43,16 @@ class Age(msgspec.Struct, frozen=True):
         }
 
 
-class Trait(msgspec.Struct, frozen=True):
+class TraitFactor(msgspec.Struct, frozen=True):
     """The ticket's trait of this name; 0 for a ticket without it."""
 
     name: str
 
     def scores(self, view: PoolView) -> Mapping[str, float]:
-        return {w.ticket.id: w.ticket.traits.get(self.name, 0.0) for w in view.waiting}
+        return {
+            w.ticket.id: next((t.value for t in w.ticket.traits if t.name == self.name), 0.0)
+            for w in view.waiting
+        }
 
 
 class Priority:

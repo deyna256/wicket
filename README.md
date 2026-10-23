@@ -114,19 +114,27 @@ error the ticket comes back once its lease ends.
 Factors score tickets in `0..1` and are weighted; limits hold together:
 
 ```python
+from wicket import Age, Rate, Trait, TraitFactor
+
 pool = Pool(
     ledger,
     "materials",
     priority=Priority(
         (FairShare(), 4),
-        (Trait("tier"), 2),  # Ticket(..., traits={"tier": 1.0})
+        (TraitFactor("tier"), 2),
         (Age(full_after=timedelta(minutes=30)), 1),
     ),
     limits=(Concurrency(4), Rate(10, per=timedelta(minutes=1))),
     lease=timedelta(minutes=2),
     poll=timedelta(seconds=1),
 )
+
+ticket = Ticket("task-1", "alice", traits=(Trait("tier", 1.0), Trait("urgent", 0.5)))
 ```
+
+`Trait(name, value)` is an immutable number in `0..1` on a ticket. `TraitFactor(name)` scores
+tickets by that named value, or `0` when absent. A ticket takes a tuple of traits with unique names;
+neither the tuple nor its traits can change. Tickets encode and decode with msgspec without hooks.
 
 ## PostgreSQL
 

@@ -1,6 +1,5 @@
-"""A ticket, the ticket in line, and the permit that leases it."""
+"""A ticket's traits, the ticket in line, and the permit that leases it."""
 
-from collections.abc import Mapping
 from datetime import datetime
 
 import msgspec
@@ -8,19 +7,32 @@ import msgspec
 type Version = int
 
 
+class Trait(msgspec.Struct, frozen=True):
+    """One named number in 0..1 describing a ticket; checked on construction and decoding."""
+
+    name: str
+    value: float
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.value <= 1:  # also refuses NaN
+            raise ValueError(f"trait {self.name!r} is {self.value}, not in 0..1")
+
+
 class Ticket(msgspec.Struct, frozen=True):
-    """A claim on a pool's capacity: the caller's row id, the tenant whose share it counts in, and
-    the traits factors read. msgspec runs the check on decoding too, so a stored ticket is
-    checked."""
+    """A claim on a pool's capacity: the caller's row id, the tenant whose share it counts in,
+    and an immutable tuple of uniquely named traits."""
 
     id: str
     tenant: str
-    traits: Mapping[str, float] = {}
+    traits: tuple[Trait, ...] = ()
 
     def __post_init__(self) -> None:
-        for name, value in self.traits.items():
-            if not 0 <= value <= 1:  # also refuses NaN
-                raise ValueError(f"trait {name!r} of ticket {self.id!r} is {value}, not in 0..1")
+        if not isinstance(self.traits, tuple) or any(
+            not isinstance(trait, Trait) for trait in self.traits
+        ):
+            raise ValueError(f"traits of ticket {self.id!r} must be a tuple of Trait values")
+        if len({trait.name for trait in self.traits}) != len(self.traits):
+            raise ValueError(f"trait names of ticket {self.id!r} must be unique")
 
 
 class Waiting(msgspec.Struct, frozen=True):
