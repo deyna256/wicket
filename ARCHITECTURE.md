@@ -63,7 +63,7 @@ in all of `src/wicket/`.
    `NoTicket` and the rest — that the caller matches on; `None` is not a result.
 6. **The decision is pure.** `Limit.admits`, `Factor.scores`, `Priority.first` and `Fairness.after`
    read a `PoolView` and return a value: no I/O, no clock, no randomness. A `Limit`'s answer may turn
-   from refuse to admit without a grant, never the reverse, so it reads only `leased`,
+   from refuse to admit without a version change, never the reverse, so it reads only `leased`,
    `grant_times`, `now` and `retention`: time passing, an expiry, a release or a withdrawal can only
    loosen it, and the version check keeps every limit.
 7. **One clock, the store's.** Every moment in a view comes from the store. The only other clock is the
@@ -92,10 +92,11 @@ in all of `src/wicket/`.
 
 ## Cross-cutting concerns
 
-**Concurrency.** Every grant is a compare-and-swap on the pool's version; nothing else changes it, so
-heartbeats and submissions never make grants conflict. The `permit()` calls of one `Pool` wait for
-a grant one at a time behind its lock, so only processes conflict and a process reads once per
-`poll`. On a conflict the pool reads again at once; with nothing to grant it sleeps a random time
+**Concurrency.** Grants and successful renewals change the pool's version. Every grant is a
+compare-and-swap on it; submissions, withdrawals and releases keep the version unchanged.
+The `permit()` calls of one `Pool` wait for a grant one at a time behind its lock, avoiding conflicts
+between those grants; renewals and other processes can still make a view stale.
+On a conflict the pool reads again at once; with nothing to grant it sleeps a random time
 between `poll / 2` and `poll`
 ([decision 2](docs/decisions/0002-pure-decision-over-a-store.md)).
 
