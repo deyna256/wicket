@@ -23,8 +23,9 @@ from wicket.view import PoolView
 
 
 class Pool:
-    """A plain class: its lock orders the `permit()` calls of this process, which wait for a grant
-    one at a time, reading, granting and sleeping, so only processes conflict with each other."""
+    """A plain class: its lock orders this pool's `permit()` calls, which wait for a grant one at
+    a time, reading, granting and sleeping. These grants cannot conflict with each other;
+    background renewals and other instances serving the same pool can still invalidate a view."""
 
     def __init__(
         self,
