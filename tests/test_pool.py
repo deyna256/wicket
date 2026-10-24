@@ -548,3 +548,84 @@ async def test_a_store_unreachable_while_waiting_propagates_and_frees_the_pool()
             pass
     async with shared.permit() as permit:  # the lock was let go
         assert permit.attempt == 1
+
+
+async def test_first_renewal_is_dated_from_the_grant_not_the_response():
+    """A grant response delayed by 25/30 of the lease must not push the first renewal (#6)."""
+    _, ledger = await submitted()
+
+    class SlowGrant(Scripted):
+        async def grant(self, *args, **kwargs):
+            answer = await super().grant(*args, **kwargs)
+            if isinstance(answer, Permit):
+                await asyncio.sleep(0.25)
+            return answer
+
+    slow = SlowGrant(ledger)
+    short = Pool(
+        slow,
+        "p",
+        priority=FAIR,
+        limits=(),
+        lease=timedelta(milliseconds=300),
+        poll=timedelta(milliseconds=10),
+    )
+    async with short.permit() as permit:
+        await asyncio.sleep(0.25)  # past the original lease end; only a timely renewal saves it
+        assert permit.attempt == 1
+    assert slow.renewals >= 1
+
+
+async def test_a_grant_response_at_or_after_expiry_never_enters_the_block():
+    """The schedule cannot help a response that lands past the lease: refuse the entry (#6)."""
+
+    def late_grant(wait: float):
+        class LateGrant(Scripted):
+            async def grant(self, *args, **kwargs):
+                answer = await super().grant(*args, **kwargs)
+                if isinstance(answer, Permit):
+                    await asyncio.sleep(wait)
+                return answer
+
+        return LateGrant
+
+    for delay in (0.30, 0.31):  # exactly at the lease's end, and after it
+        _, real = await submitted()
+
+        entered = False
+        with pytest.raises(LeaseLostError):
+            async with Pool(
+                late_grant(delay)(real),
+                "p",
+                priority=FAIR,
+                limits=(),
+                lease=timedelta(milliseconds=300),
+                poll=timedelta(milliseconds=10),
+            ).permit():
+                entered = True
+        assert not entered
+
+
+async def test_an_expired_response_with_an_unsuspended_block_completes_no_renewals():
+    """A block without a single await must not slip past the entry check with zero renewals (#6)."""
+    _, ledger = await submitted()
+
+    class LateGrant(Scripted):
+        async def grant(self, *args, **kwargs):
+            answer = await super().grant(*args, **kwargs)
+            if isinstance(answer, Permit):
+                await asyncio.sleep(0.31)
+            return answer
+
+    slow = LateGrant(ledger)
+    with pytest.raises(LeaseLostError):
+        async with Pool(
+            slow,
+            "p",
+            priority=FAIR,
+            limits=(),
+            lease=timedelta(milliseconds=300),
+            poll=timedelta(milliseconds=10),
+        ).permit():
+            pass
+    assert slow.renewals == 0

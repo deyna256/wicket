@@ -60,6 +60,11 @@ class Pool:
         async with self._turn:
             permit, since = await self._granted()
         renewal = _Renewal(self._ledger, permit, self._lease, since, task)
+        if asyncio.get_running_loop().time() >= since + self._lease.total_seconds():
+            # The grant response came after the lease could have ended: the store may
+            # deliver the ticket again at any moment, so the block never enters on an
+            # expired lease (#6). Scheduling alone cannot promise that.
+            raise renewal.error
         keeper = asyncio.create_task(renewal.keep())
         cancelling = task.cancelling()
         try:
@@ -145,7 +150,10 @@ class _Renewal:
     async def _renewing(self) -> None:
         loop, seconds = asyncio.get_running_loop(), self._lease.total_seconds()
         while True:
-            await asyncio.sleep(seconds / 3)
+            # Date the wait from the recorded grant, not from when its response
+            # arrived: a slow grant otherwise pushes the first renewal past the
+            # lease's end (#6).
+            await asyncio.sleep(max(0.0, self._since + seconds / 3 - loop.time()))
             while True:
                 tried, last_try = loop.time(), self._since + seconds - seconds / 30
                 deadline = asyncio.timeout_at(last_try)
