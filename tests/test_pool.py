@@ -548,3 +548,39 @@ async def test_a_store_unreachable_while_waiting_propagates_and_frees_the_pool()
             pass
     async with shared.permit() as permit:  # the lock was let go
         assert permit.attempt == 1
+
+
+class LateGrant(Scripted):
+    """A ledger that answers a successful grant `delay` seconds after the store made it."""
+
+    def __init__(self, ledger: MemoryLedger, delay: float) -> None:
+        super().__init__(ledger)
+        self.delay = delay
+
+    async def grant(
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
+    ) -> Permit | Conflict | Missing:
+        answer = await super().grant(pool, waiting, version=version, lease=lease, fairness=fairness)
+        if isinstance(answer, Permit):
+            await asyncio.sleep(self.delay)
+        return answer
+
+
+async def test_the_first_renewal_is_due_from_the_grant_not_its_response():
+    _, ledger = await submitted()
+    late = LateGrant(ledger, 25)
+    async with pool(late).permit():
+        await asyncio.sleep(25)  # past the lease's end: only a renewal at once keeps it
+    assert late.renewals >= 1
+
+
+@pytest.mark.parametrize("delay", [30, 31])  # at the lease's end, and after it
+async def test_a_grant_answered_once_its_lease_could_have_ended_never_enters_the_block(delay: int):
+    _, ledger = await submitted()
+    late, entered = LateGrant(ledger, delay), False
+    with pytest.raises(LeaseLostError):
+        async with pool(late).permit():
+            entered = True  # never suspends, so no renewal could stop it
+    assert not entered
+    assert late.renewals == 0
+    assert await attempt_of_next_grant(ledger) == 2

@@ -9,7 +9,8 @@ worker that wakes up must not overwrite the result of the worker that took the t
 
 ## Decision
 
-- **A permit is a lease** that `pool.permit()` renews every `lease / 3` while the block runs. A
+- **A permit is a lease** that `pool.permit()` renews `lease / 3` after the grant was asked for,
+  then `lease / 3` after each successful renewal was asked for, while the block runs. A
   renewal that raises `StoreUnavailable` is retried every `lease / 30` until the lease would end,
   measured on the event loop's clock.
 - **Only a block that ends normally releases,** because a release means the work is done, as an
@@ -17,7 +18,11 @@ worker that wakes up must not overwrite the result of the worker that took the t
   consumer deletes a message only after processing it. An error of the body, a cancellation from
   outside and a lost lease release nothing, and the ticket is delivered again once its lease ends.
 - **A lost lease cancels the block** with `LeaseLostError`, even if the body caught the
-  cancellation and ended normally. `LeaseLostError` means only that.
+  cancellation and ended normally.
+- **A grant that arrives too late never enters the block.** If the grant's response comes after
+  its lease could have ended, measured from when the grant was asked for on the event loop's clock,
+  `permit()` raises `LeaseLostError` without running the block, and the ticket is delivered again.
+  `LeaseLostError` means only a lost lease.
 - **Expiry is the store's.** Once the store's clock passes the lease end the ticket is waiting again,
   with its `submitted_at` and grant count kept.
 - **A late release succeeds** while no one has leased the ticket again; it removes a ticket that is
