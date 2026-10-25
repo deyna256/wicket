@@ -1,6 +1,6 @@
 [project]
 name = "wicket"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fair admission of work to shared capacity: which waiting ticket may start now, by priority, fairness between tenants, and limits on concurrency and rate."
 keywords = [
     "scheduling", "admission-control", "fair-queuing", "fairness", "priority", "multi-tenant",

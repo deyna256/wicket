@@ -157,9 +157,13 @@ async with session.begin():  # your transaction: the row and its ticket commit t
 ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retention in every process
 ```
 
-Existing databases need the
+## Upgrading from 0.1.0 to 0.2.0
+
+This release changes [ticket traits](https://github.com/deyna256/wicket/blob/main/docs/decisions/0003-priority-from-factors.md)
+and the [Ledger contract](https://github.com/deyna256/wicket/blob/main/docs/decisions/0002-pure-decision-over-a-store.md).
+Upgrade all producers, workers and custom adapters sharing a pool together. Existing databases need the
 [submission ID migration](https://github.com/deyna256/wicket/blob/main/docs/decisions/0007-postgres-store.md#adding-submission-ids-to-an-existing-table)
-before using the updated adapters.
+before using the updated adapters; follow its stop, migrate and upgrade instructions before resuming work.
 
 ## Status
 
