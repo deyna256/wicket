@@ -21,8 +21,7 @@ is usually SQLAlchemy.
   connection from the engine. The driver is the caller's, through its URL: asyncpg or psycopg.
 - **The tables are `MetaData` for the caller's migrations**, named `wicket_pools`,
   `wicket_tickets` and `wicket_grants`. wicket ships no migrations and creates no tables.
-- **Traits are a JSONB array of name/value records**, preserving their tuple order. The reader also
-  accepts the name-to-number objects written by 0.1.0 and validates both formats through `Ticket`.
+- **Traits are a JSONB array of name/value records**, preserving their tuple order.
 - **Lanes:** `lane` on `wicket_tickets` and `wicket_grants`, and `wicket_lanes`, a presence per pool
   and lane, extended with `GREATEST` so that a short poll never shortens a long one's presence
   ([decision 8](0008-lanes.md)).
@@ -54,27 +53,4 @@ is usually SQLAlchemy.
 - A caller without SQLAlchemy writes its own adapter of the two ports and runs the store contract
   on it.
 - Every process serving a pool passes the same `retention`.
-- Upgrade all workers sharing a pool to enforce renewal/version atomicity, including custom
-  ledgers. This change needs no schema migration; old renewers can still bypass the guarantee.
-- Upgrade every process sharing a pool before writing the new trait format: 0.1.0 readers cannot
-  read the arrays. Existing rows need no migration; the JSONB column's type stays the same.
 - The PostgreSQL tests need a database: a server URL or Docker; CI runs them on Ubuntu.
-
-## Adding submission IDs to an existing table
-
-Stop producers and workers sharing the table. Add this to the caller's migrations before starting
-the updated adapters:
-
-```sql
-ALTER TABLE wicket_tickets
-    ADD COLUMN submission_id uuid NOT NULL DEFAULT gen_random_uuid();
-```
-
-PostgreSQL gives every existing row a UUID and generates one for each future insert. Ticket data,
-leases, permit tokens and fairness are preserved. `metadata.create_all()` does not alter an existing
-table, so it is not a substitute for this migration.
-
-Upgrade every worker before resuming: old `grant` implementations do not check submission identity.
-Custom ledgers and wrappers must now accept the chosen `Waiting` instead of a ticket id. A manually
-constructed or decoded `Waiting` also requires `submission_id`; discard old cached snapshots and
-read a fresh view after upgrading.

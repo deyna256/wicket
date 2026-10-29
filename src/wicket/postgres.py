@@ -339,10 +339,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
 
     def _waiting(self, row: Row[*tuple[Any, ...]]) -> Waiting:
         """A ticket read back through Ticket's own checks, at UTC whatever the session's zone."""
-        traits = row.traits
-        if isinstance(traits, dict):  # tickets written before traits became immutable values
-            traits = [{"name": name, "value": value} for name, value in traits.items()]
         ticket = msgspec.convert(
-            {"id": row.id, "tenant": row.tenant, "traits": traits, "lane": row.lane}, Ticket
+            {"id": row.id, "tenant": row.tenant, "traits": row.traits, "lane": row.lane}, Ticket
         )
         return Waiting(ticket, row.submitted_at.astimezone(UTC), row.submission_id, row.grants)

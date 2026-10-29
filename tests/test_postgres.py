@@ -27,7 +27,7 @@ from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.priority import FairShare, Priority
 from wicket.results import Conflict, LeaseLost, Missing, Renewed, StoreUnavailable, Withdrawn
-from wicket.tickets import Permit, Ticket, Trait, Waiting
+from wicket.tickets import Permit, Ticket, Waiting
 
 pytestmark = pytest.mark.postgres
 
@@ -94,52 +94,6 @@ async def terminate_every_session(url: URL) -> None:
     await until(url, f"not exists (select {OTHERS})")
 
 
-async def test_submission_id_migration_preserves_existing_tickets(engine: AsyncEngine):
-    await submit(engine, "1", "2", "3")
-    ledger = PostgresLedger(engine, HOUR)
-    permit = await grant_first(ledger)
-    assert isinstance(permit, Permit)
-    before = await ledger.view("p")
-
-    async with engine.begin() as connection:
-        await connection.execute(text("ALTER TABLE wicket_tickets DROP COLUMN submission_id"))
-        await connection.execute(
-            text(
-                "ALTER TABLE wicket_tickets "
-                "ADD COLUMN submission_id uuid NOT NULL DEFAULT gen_random_uuid()"
-            )
-        )
-        ids = (await connection.execute(text("SELECT submission_id FROM wicket_tickets"))).scalars()
-        submission_ids = list(ids)
-        assert len(set(submission_ids)) == 3
-        assert all(value.version == 4 for value in submission_ids)
-
-    after = await ledger.view("p")
-    originals = {waiting.ticket.id: waiting for waiting in before.waiting}
-    restored = tuple(
-        msgspec.structs.replace(waiting, submission_id=originals[waiting.ticket.id].submission_id)
-        for waiting in after.waiting
-    )
-    leased = msgspec.structs.replace(
-        after.leased[0],
-        waiting=msgspec.structs.replace(
-            after.leased[0].waiting, submission_id=before.leased[0].waiting.submission_id
-        ),
-    )
-    assert msgspec.structs.replace(after, waiting=restored, leased=(leased,)) == before
-    assert await ledger.renew(permit, lease=LEASE) == Renewed()
-    await submit(engine, "4")
-    fresh = await ledger.view("p")
-    added = next(waiting for waiting in fresh.waiting if waiting.ticket.id == "4")
-    assert added.submission_id.version == 4
-    assert isinstance(
-        await ledger.grant(
-            "p", added, version=fresh.version, lease=LEASE, fairness=fresh.fairness.after(added, ())
-        ),
-        Permit,
-    )
-
-
 async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(engine: AsyncEngine):
     await submit(engine, "1", "2")
     ledger = PostgresLedger(engine, HOUR)
@@ -204,30 +158,25 @@ async def test_a_replacement_committed_during_a_grant_is_missing(engine: AsyncEn
     assert view.waiting[0].grants == 0
 
 
-async def test_traits_written_as_a_dictionary_still_read_as_immutable_values(engine: AsyncEngine):
+async def test_invalid_stored_traits_are_rejected(engine: AsyncEngine):
+    await submit(engine, "1")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text("update wicket_tickets set traits = cast(:traits as jsonb)"),
+            {"traits": '[{"name": "tier", "value": 99}]'},
+        )
+    with pytest.raises(msgspec.ValidationError, match=r"not in 0\.\.1"):
+        await PostgresLedger(engine, HOUR).view("p")
+
+
+async def test_traits_stored_as_a_dictionary_are_rejected(engine: AsyncEngine):
     await submit(engine, "1")
     async with engine.begin() as connection:
         await connection.execute(
             text("update wicket_tickets set traits = cast(:traits as jsonb)"),
             {"traits": '{"tier": 0.5}'},
         )
-    ledger = PostgresLedger(engine, HOUR)
-    assert (await ledger.view("p")).waiting[0].ticket.traits == (Trait("tier", 0.5),)
-    permit = await grant_first(ledger)
-    assert isinstance(permit, Permit)
-    assert permit.waiting.ticket.traits == (Trait("tier", 0.5),)
-    with pytest.raises(AttributeError):
-        permit.waiting.ticket.traits[0].value = 99.0  # ty: ignore[invalid-assignment]
-
-
-@pytest.mark.parametrize("traits", ['{"tier": 99}', '[{"name": "tier", "value": 99}]'])
-async def test_invalid_stored_traits_are_rejected_in_both_formats(engine: AsyncEngine, traits: str):
-    await submit(engine, "1")
-    async with engine.begin() as connection:
-        await connection.execute(
-            text("update wicket_tickets set traits = cast(:traits as jsonb)"), {"traits": traits}
-        )
-    with pytest.raises(msgspec.ValidationError, match=r"not in 0\.\.1"):
+    with pytest.raises(msgspec.ValidationError):
         await PostgresLedger(engine, HOUR).view("p")
 
 
