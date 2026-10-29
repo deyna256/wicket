@@ -20,17 +20,16 @@ up to its own ceiling, but in one scheduler that sees every class.
 - **A `Pool` serves one `Lane(name, *limits)`** and grants only its tickets. The lane's limits count
   only its leased tickets and grants; the pool's `limits` count every lane. `Pool` serves `Lane("")`
   unless given another.
-- **Fairness is judged across every lane that can take work.** A worker makes its lane present in
-  the store (`Ledger.attend`, for `2 × poll`) while the lane has a waiting ticket that its own
-  limits let it take, and leaves once it has none. When another lane shows in its view (a waiting or
-  leased ticket, a recent grant or a presence), it does so before it tries to grant, so the other
-  lane sees it while its grant is on its way; when its lane is alone, it does so after a pass
-  without a grant, so a lane waiting at the pool's limit is present before another lane appears. It
-  chooses among its own lane's tickets and every present lane's, and grants only if the winner is
-  its own; otherwise it yields, and the winner's lane takes it. Presences never change the version:
-  they steer which ticket is chosen, never whether one may start, which the version check keeps
-  deciding. As in HTB, only a lane with a backlog under its own ceiling competes; as in Temporal's
-  pollers, a worker's presence expires rather than being withdrawn.
+- **Fairness is judged across every lane that can take work.** Before every attempt to grant, a
+  worker makes its lane present in the store (`Ledger.attend`, for `2 × poll`) while the lane has a
+  waiting ticket that its own limits let it take, and leaves once it has none. So a lane is seen
+  while it waits at the pool's limit and while its grant is on its way, by lanes already there and
+  by lanes that appear meanwhile. It chooses among its own lane's tickets and every present lane's,
+  and grants only if the winner is its own; otherwise it yields, and the winner's lane takes it.
+  Presences never change the version: they steer which ticket is chosen, never whether one may
+  start, which the version check keeps deciding. As in HTB, only a lane with a backlog under its own
+  ceiling competes; as in Temporal's pollers, a worker's presence expires rather than being
+  withdrawn.
 - **Every waiting tenant keeps its fairness tag, and ties go to the one served longest ago**
   ([decision 4](0004-start-time-fair-queuing.md)), so tenants of a lane served less often still take
   turns.
@@ -59,14 +58,17 @@ up to its own ceiling, but in one scheduler that sees every class.
 - **Yielding only when the pool is short of capacity.** It would save the yield's latency when there
   is room for both, but the simple rule ("room for one more") let a lane with many workers fill a
   refilled `Rate` before the other polled. A correct rule must reserve room for every present lane.
+- **Writing a presence only when another lane is in view, or only after a pass without a grant.**
+  Each left a window: a lane appearing while another's grant was on its way, or a lane waiting at
+  the limit before its neighbour arrived, took every freed slot of a minute in tests.
 - **Presence on the pool row, or written by `view` or `grant`.** The row is what the grant's
   compare-and-swap locks; a view is a read-only snapshot; a grant misses the lane that yields.
 
 ## Consequences
 
-- About one presence write per lane every two passes while it has a candidate and either another
-  lane shows in the pool or its workers wait at a limit; none for a lone lane that grants at once,
-  nor for an idle one.
+- At most about one presence write per lane per `poll` while it has a candidate, whatever its grant
+  rate: a presence lasts `2 × poll` and is renewed only when it would end within `poll`. A pool of
+  one lane pays it too; an idle lane writes nothing.
 - A worker whose grant takes longer than `2 × poll` stops being seen until its next pass.
 - Renewals in every lane change one version, so lanes conflict more often.
 - A view reads every lane's tickets: merging pools multiplies the view size

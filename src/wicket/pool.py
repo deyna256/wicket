@@ -94,17 +94,14 @@ class Pool:
         """The permit, and the event loop's time just before the grant that made it."""
         while True:
             view = await self._ledger.view(self._name)
-            alone = view.in_lanes(self._lane.name) == view
-            if not alone:  # another lane may choose while this grant is on its way: be seen first
-                await self._attend(view)
+            # be seen before granting: a lane may appear, or choose, while this grant is on its way
+            await self._attend(view)
             match await self._attempt(view):
                 case (Permit() as permit, float() as since):
                     return permit, since
                 case Conflict():
                     continue  # a grant or renewal changed the version: read again at once
                 case NoTicket():
-                    if alone:  # waiting at a limit: be seen by a lane that comes later
-                        await self._attend(view)
                     seconds = self._poll.total_seconds()
                     await asyncio.sleep(random.uniform(seconds / 2, seconds))
 

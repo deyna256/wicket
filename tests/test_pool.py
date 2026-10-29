@@ -669,7 +669,7 @@ async def test_the_presence_of_a_worker_gone_away_expires_and_the_others_go_on()
     assert order == ["g0", "g1"] and now() < 6
 
 
-async def test_a_pool_granting_at_once_and_a_lane_with_nothing_waiting_write_no_presence():
+async def test_a_lane_granting_at_once_writes_once_a_poll_and_one_with_nothing_waiting_never():
     backlog, ledger = store()
     for n in range(3):
         await backlog.submit("p", Ticket(f"a{n}", "a"))
@@ -682,7 +682,8 @@ async def test_a_pool_granting_at_once_and_a_lane_with_nothing_waiting_write_no_
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(3), pool(idle, lane=Lane("m")).permit():
             pass
-    assert (plain.attendance, idle.attendance) == ([], [])
+    # three grants in one moment: the presence written before the first lasts past the others
+    assert (plain.attendance, idle.attendance) == ([""], [])
 
 
 class SlowGrant(Scripted):
@@ -710,6 +711,23 @@ async def test_a_lane_is_seen_while_its_grant_is_on_its_way():
     await asyncio.sleep(0)  # bob's worker has read the pool and is granting
     alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
     await asyncio.sleep(1.5)  # within bob's presence, 2 * poll from his pass
+    assert order == []  # mentor yields to bob, due first, whose grant is still on its way
+    slow.through.set()
+    await asyncio.gather(bob, alice)
+    assert order == ["bob", "alice0"]
+
+
+async def test_a_lane_is_seen_by_a_lane_that_appears_while_its_grant_is_on_its_way():
+    backlog, ledger = store()
+    await backlog.submit("p", Ticket("bob", "bob", lane="g"))
+    slow, order = SlowGrant(ledger), []
+    bob = asyncio.create_task(work(pool(slow, lane=Lane("g")), order, 0))
+    await asyncio.sleep(0)  # bob's worker read a pool of one lane and is granting
+    await asyncio.sleep(1)
+    for n in range(3):
+        await backlog.submit("p", Ticket(f"alice{n}", "alice", lane="m"))
+    alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
+    await asyncio.sleep(0.5)  # within bob's presence, 2 * poll from his pass
     assert order == []  # mentor yields to bob, due first, whose grant is still on its way
     slow.through.set()
     await asyncio.gather(bob, alice)
