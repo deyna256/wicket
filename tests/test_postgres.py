@@ -690,3 +690,38 @@ async def test_workers_attending_at_once_write_the_presence_once(engine: AsyncEn
             for statement in UNCOUNT_LANE_WRITES:
                 await connection.execute(text(statement))
     assert writes == 2  # one insert, one renewal; the other 18 calls wrote nothing
+
+
+async def test_an_attend_that_waited_for_the_row_never_shortens_the_presence(
+    engine: AsyncEngine, url: URL
+):
+    # PostgreSQL's own clock_timestamp(), which moves while the attend waits, not the test clock
+    real_clock = settings(url, search_path="pg_catalog,public")
+    async with opened(url, connect_args=real_clock) as realtime:
+        ledger = PostgresLedger(realtime, HOUR)
+        await ledger.attend("p", "m", ttl=timedelta(seconds=3))
+        async with realtime.connect() as holding:
+            held = await holding.begin()
+            before = await holding.scalar(
+                text("select present_until from wicket_lanes where lane = 'm' for update")
+            )
+            attending = asyncio.create_task(ledger.attend("p", "m", ttl=timedelta(seconds=1)))
+            try:
+                await until(
+                    url,
+                    "exists (select 1 from pg_stat_activity where datname = current_database()"
+                    " and wait_event_type = 'Lock' and query like 'INSERT INTO wicket_lanes%')",
+                )
+                now = await holding.scalar(text("select pg_catalog.clock_timestamp()"))
+                # release the row when the presence has 0.3 s left: within half the new ttl
+                await asyncio.sleep(max(0.0, (before - now).total_seconds() - 0.3))
+                await held.commit()
+                await asyncio.wait_for(attending, 2)
+            finally:
+                attending.cancel()
+                await asyncio.gather(attending, return_exceptions=True)
+        async with realtime.connect() as connection:
+            after = await connection.scalar(
+                text("select present_until from wicket_lanes where lane = 'm'")
+            )
+    assert after >= before
