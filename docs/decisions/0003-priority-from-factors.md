@@ -17,9 +17,10 @@ ticket is, and how importance becomes a choice.
   priority](https://slurm.schedmd.com/priority_multifactor.html), and `first(view)` returns the
   ticket with the highest weighted sum; ties go to the tenant with the smallest fairness tag, served
   longest ago ([decision 4](0004-start-time-fair-queuing.md)), then the earlier `submitted_at`, then
-  the smaller id. An empty `Priority` takes tenants in turn, each first in, first out. Weights are non-negative and their sum must fit in a finite float;
-  `Priority` rejects an unsupported configuration with `ValueError` at construction, so valid factor
-  scores cannot overflow the weighted sum.
+  the smaller id. An empty `Priority` takes tenants in turn, each first in, first out. Weights are
+  non-negative and their sum must fit in a finite float; `Priority` rejects an unsupported
+  configuration with `ValueError` at construction, so valid factor scores cannot overflow the
+  weighted sum.
 - **No ordering seam.** Fairness and favouring a user are both factors, so a second discipline would
   solve the same problems less predictably.
 - **What a weight means:** a factor decides alone when its weight times the smallest step between its

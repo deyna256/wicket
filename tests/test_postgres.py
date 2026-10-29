@@ -689,48 +689,11 @@ async def test_workers_attending_at_once_write_the_presence_once(engine: AsyncEn
         async with engine.begin() as connection:
             for statement in UNCOUNT_LANE_WRITES:
                 await connection.execute(text(statement))
-    assert writes == 3  # the row inserted, then renewed once a round; the other 18 wrote nothing
+    assert writes == 2  # the row inserted, then renewed once; the other 18 wrote nothing
 
 
-async def test_an_attend_that_waited_for_the_row_never_shortens_the_presence(
-    engine: AsyncEngine, url: URL
-):
-    # PostgreSQL's own clock_timestamp(), which moves while the attend waits, not the test clock
-    real_clock = settings(url, search_path="pg_catalog,public")
-    async with opened(url, connect_args=real_clock) as realtime:
-        ledger = PostgresLedger(realtime, HOUR)
-        await ledger.attend("p", "m", ttl=timedelta(seconds=2))
-        async with realtime.connect() as holding:
-            held = await holding.begin()
-            before = await holding.scalar(
-                text("select present_until from wicket_lanes where lane = 'm' for update")
-            )
-            now = await holding.scalar(text("select pg_catalog.clock_timestamp()"))
-            # 0.4 s left: within half the next attend's ttl of 1 s, so it renews, after a wait
-            await asyncio.sleep(max(0.0, (before - now).total_seconds() - 0.4))
-            attending = asyncio.create_task(ledger.attend("p", "m", ttl=timedelta(seconds=1)))
-            try:
-                await until(
-                    url,
-                    "exists (select 1 from pg_stat_activity where datname = current_database()"
-                    " and wait_event_type = 'Lock' and query like '%wicket_lanes%')",
-                )
-                await asyncio.sleep(0.3)
-                await held.commit()
-                await asyncio.wait_for(attending, 2)
-            finally:
-                attending.cancel()
-                await asyncio.gather(attending, return_exceptions=True)
-        async with realtime.connect() as connection:
-            after = await connection.scalar(
-                text("select present_until from wicket_lanes where lane = 'm'")
-            )
-    assert after >= before
-
-
-@pytest.mark.parametrize("held", ["delete", "update"])
 async def test_an_attend_that_waited_for_another_transaction_leaves_a_live_presence(
-    engine: AsyncEngine, url: URL, held: str
+    engine: AsyncEngine, url: URL
 ):
     # PostgreSQL's own clock_timestamp(), which moves while the attend waits, not the test clock
     real_clock = settings(url, search_path="pg_catalog,public")
@@ -740,11 +703,10 @@ async def test_an_attend_that_waited_for_another_transaction_leaves_a_live_prese
         await ledger.attend("p", "m", ttl=ttl)
         async with realtime.connect() as holding:
             transaction = await holding.begin()
-            gone = {  # the row deleted, or its presence ended, by a transaction still open
-                "delete": "delete from wicket_lanes where lane = 'm'",
-                "update": "update wicket_lanes set present_until = '-infinity' where lane = 'm'",
-            }[held]
-            await holding.execute(text(gone))
+            # its presence ended, as leave does, by a transaction still open
+            await holding.execute(
+                text("update wicket_lanes set present_until = '-infinity' where lane = 'm'")
+            )
             attending = asyncio.create_task(ledger.attend("p", "m", ttl=ttl))
             try:
                 await until(

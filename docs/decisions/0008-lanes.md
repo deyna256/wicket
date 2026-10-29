@@ -52,9 +52,8 @@ up to its own ceiling, but in one scheduler that sees every class.
 - **Choosing within one's own lane.** Simple, but after alice's grant in Mentor, with alice-m2 waiting
   there and bob-g1 in Generation, Mentor picks alice again: the shared fairness is only a shared
   history.
-- **A lane's presence expiring without `leave`.** In simulation, a lane at its own `Concurrency(1)`
-  kept the others yielding to tickets nobody took: idle time rose from 106–111 s to 664–690 s, and starts
-  fell 19%.
+- **A lane's presence expiring without `leave`.** A lane at its own cap would keep the others
+  yielding to tickets nobody takes until its presence ends.
 - **Yielding only when the pool is short of capacity.** It would save the yield's latency when there
   is room for both, but the simple rule ("room for one more") let a lane with many workers fill a
   refilled `Rate` before the other polled. A correct rule must reserve room for every present lane.
@@ -69,11 +68,9 @@ up to its own ceiling, but in one scheduler that sees every class.
 - About one presence write per lane per `poll` while it has a candidate, whatever its grant rate or
   number of workers: a presence lasts `2 × poll`, and `attend` renews it only when it would end
   within `poll`, a condition the store checks atomically. Workers that read the same old presence
-  still each send an `attend` (up to one per worker per `poll`; two statements each in PostgreSQL),
-  and they queue briefly on the lane's row, but only the first writes; `leave` likewise writes only
-  a presence still live. Workers of one lane with different polls
-  renew it on their own schedules (polls of 1 s and 2 s wrote it twice where one poll writes once),
-  so keep a lane's polls alike. A pool of one lane pays this too; an idle lane writes nothing.
+  each send an `attend`, but only the first writes; `leave` writes only a live presence. Workers of
+  one lane with different polls renew it on their own schedules, so keep a lane's polls alike. A
+  pool of one lane pays this too; an idle lane writes nothing.
 - A worker whose grant takes longer than `2 × poll` stops being seen until its next pass.
 - Renewals in every lane change one version, so lanes conflict more often.
 - A view reads every lane's tickets: merging pools multiplies the view size

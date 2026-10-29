@@ -303,10 +303,11 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         return Released() if released.rowcount == 1 else LeaseLost()
 
     async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
-        # The row first, ended: an insert takes its values before any wait, so it sets no time.
-        row = upsert(_lanes).values(pool=pool, lane=lane, present_until=_ENDED)
-        # Then the time, read once the row is locked; the condition is rechecked after a concurrent
-        # attend commits, so workers attending at once write once, and a longer presence stays.
+        until = func.clock_timestamp() + self._seconds(ttl)
+        row = upsert(_lanes).values(pool=pool, lane=lane, present_until=until)
+        # Renews a row the insert found, or one it made with a clock read before a wait. The clock
+        # is read once the row is locked and the condition rechecked after a concurrent attend
+        # commits, so workers attending at once write once, and a longer presence stays.
         renew = (
             update(_lanes)
             .where(
@@ -314,7 +315,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
                 _lanes.c.lane == lane,
                 _lanes.c.present_until <= func.clock_timestamp() + self._seconds(ttl / 2),
             )
-            .values(present_until=func.clock_timestamp() + self._seconds(ttl))
+            .values(present_until=until)
         )
         async with self._connection(_COMMITTED) as connection:
             await connection.execute(row.on_conflict_do_nothing())

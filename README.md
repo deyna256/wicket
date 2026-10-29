@@ -139,7 +139,8 @@ neither the tuple nor its traits can change. Tickets encode and decode with msgs
 ## Lanes
 
 Kinds of work that share one capacity are lanes of one pool: each lane has limits of its own, the
-pool's limits count them all, and a freed slot goes to the tenant whose turn it is in any lane.
+pool's limits count them all, and a freed slot goes to the tenant whose turn it is in any lane
+with a waiting worker.
 
 ```python
 from wicket import Lane

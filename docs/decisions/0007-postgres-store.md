@@ -19,16 +19,13 @@ is usually SQLAlchemy.
 - **`PostgresBacklog(session)`** works on the caller's `AsyncSession` and never commits.
   **`PostgresLedger(engine, retention)`** runs each call in a short transaction of its own on a
   connection from the engine. The driver is the caller's, through its URL: asyncpg or psycopg.
-- **The tables are `MetaData` for the caller's migrations**, named `wicket_pools`,
-  `wicket_tickets` and `wicket_grants`. wicket ships no migrations and creates no tables.
+- **The tables are `MetaData` for the caller's migrations**, named `wicket_pools`, `wicket_tickets`,
+  `wicket_grants` and `wicket_lanes`. wicket ships no migrations and creates no tables.
 - **Traits are a JSONB array of name/value records**, preserving their tuple order.
-- **Lanes:** `lane` on `wicket_tickets` and `wicket_grants`, and `wicket_lanes`, one row per pool
-  and lane that is never deleted: `leave` ends its presence, if it is still live. `attend` makes sure the row exists
-  (an insert of an ended presence, since an insert takes its values before any wait), then renews
-  it with an update that reads the clock once the row is locked and only while the presence would
-  end within half its ttl. PostgreSQL rechecks that condition after a concurrent writer commits,
-  so workers attending at once write once and a longer presence is never shortened
-  ([decision 8](0008-lanes.md)).
+- **Lanes:** `lane` on `wicket_tickets` and `wicket_grants`, and a `wicket_lanes` row per pool and
+  lane, never deleted: `leave` ends a live presence. `attend` inserts the row if it is missing,
+  then renews it with an update, whose clock is read once the row is locked and whose condition
+  PostgreSQL rechecks after a concurrent writer commits ([decision 8](0008-lanes.md)).
 - **The store's clock only**: a view reads `now()`, every other call `clock_timestamp()`, and times
   are read back as UTC.
 - **Submission identity is a UUID column with `gen_random_uuid()` as its default.** A grant matches

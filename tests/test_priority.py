@@ -47,12 +47,11 @@ def drain(
                 return order, view.fairness
             case Waiting() as chosen:
                 order.append(chosen.ticket.tenant)
-                view = granted(view, view, chosen)
+                view = granted(view, chosen)
 
 
-def granted(view: PoolView, among: PoolView, chosen: Waiting) -> PoolView:
-    """The pool after granting `chosen` from `among`, a part of `view`: fairness sees every tenant
-    waiting in `view`."""
+def granted(view: PoolView, chosen: Waiting) -> PoolView:
+    """The pool after granting `chosen`: fairness sees every tenant waiting in `view`."""
     tenants = {w.ticket.tenant for w in view.waiting}
     return msgspec.structs.replace(
         view.without(chosen.ticket.id), fairness=view.fairness.after(chosen, tenants)
@@ -108,10 +107,7 @@ def test_a_waiting_tenant_gets_a_tag_at_the_new_virtual_time_and_one_gone_loses_
     assert fairness.tags_of(["a", "b", "never"]) == {"a": 1, "b": 0, "never": 0}
     for n in range(3):
         fairness = fairness.after(ticket(f"c{n}", "c"), {"b", "c"})
-    assert dict(fairness.tags) == {
-        "b": 0,
-        "c": 3,
-    }  # a has nothing waiting: dropped once v passed it
+    assert dict(fairness.tags) == {"b": 0, "c": 3}  # a waits for nothing: dropped once v passed it
 
 
 def test_tenants_of_a_slower_lane_take_turns_while_a_faster_lane_takes_most_grants():
@@ -131,7 +127,7 @@ def test_tenants_of_a_slower_lane_take_turns_while_a_faster_lane_takes_most_gran
         assert isinstance(chosen, Waiting)
         if step % 4 == 3:
             order.append(chosen.ticket.tenant)
-        view = granted(view, among, chosen)
+        view = granted(view, chosen)
     assert "".join(order) == "acacacacac"
 
 
@@ -166,7 +162,7 @@ def test_tenants_passed_over_by_a_heavier_factor_still_take_turns_among_themselv
             assert isinstance(chosen, Waiting)
             if chosen.ticket.tenant != "bob":
                 order.append(chosen.ticket.tenant)
-            view = granted(view, view, chosen)
+            view = granted(view, chosen)
     assert order == ["alice", "carol"] * 2
 
 

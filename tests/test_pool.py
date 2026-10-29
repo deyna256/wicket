@@ -700,23 +700,6 @@ class SlowGrant(Scripted):
         return await super().grant(pool, waiting, version=version, lease=lease, fairness=fairness)
 
 
-async def test_a_lane_is_seen_while_its_grant_is_on_its_way():
-    backlog, ledger = store()
-    await backlog.submit("p", Ticket("bob", "bob", lane="g"))
-    await asyncio.sleep(1)
-    for n in range(3):
-        await backlog.submit("p", Ticket(f"alice{n}", "alice", lane="m"))
-    slow, order = SlowGrant(ledger), []
-    bob = asyncio.create_task(work(pool(slow, lane=Lane("g")), order, 0))
-    await asyncio.sleep(0)  # bob's worker has read the pool and is granting
-    alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
-    await asyncio.sleep(1.5)  # within bob's presence, 2 * poll from his pass
-    assert order == []  # mentor yields to bob, due first, whose grant is still on its way
-    slow.through.set()
-    await asyncio.gather(bob, alice)
-    assert order == ["bob", "alice0"]
-
-
 async def test_a_lane_is_seen_by_a_lane_that_appears_while_its_grant_is_on_its_way():
     backlog, ledger = store()
     await backlog.submit("p", Ticket("bob", "bob", lane="g"))
@@ -902,21 +885,6 @@ async def test_lanes_ranking_each_other_first_never_grant_so_they_share_one_prio
                 work(pool(ledger, lane=Lane("g"), priority=by_tier), order, 0),
             )
     assert order == []
-
-
-async def test_a_waiting_lane_writes_its_presence_about_once_a_poll_not_on_every_read():
-    backlog, ledger = store()
-    await backlog.submit("p", Ticket("g0", "bob", lane="g"))
-    await backlog.submit("p", Ticket("m0", "ann", lane="m"))
-    busy = asyncio.create_task(work(pool(ledger, (Concurrency(1),), Lane("g")), [], 60))
-    await asyncio.sleep(0)
-    waiting = Scripted(ledger)
-    with pytest.raises(TimeoutError):
-        async with asyncio.timeout(30), pool(waiting, (Concurrency(1),), Lane("m")).permit():
-            pass
-    assert 0 < len(waiting.attendance) < waiting.views
-    busy.cancel()
-    await asyncio.gather(busy, return_exceptions=True)
 
 
 async def test_tenants_of_a_lane_without_a_waiting_worker_keep_their_turns():

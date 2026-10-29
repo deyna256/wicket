@@ -48,8 +48,7 @@ Each was tried by review or simulation:
 
 - Fairness counts starts, not running time: a tenant whose work takes ten minutes holds more slots
   than one whose work takes one.
-- The state is as large as the recently served tenants: a few dozen in normal load, up to the
-  waiting tenants under overload.
+- The state holds a tag for every tenant with a waiting ticket and every one served recently.
 - The fairness properties hold while `FairShare` decides alone.
 - Weighted shares, `finish = start + 1 / weight`, can come later without changing the contract;
   the tie by raw tag is shown for equal weights only.
