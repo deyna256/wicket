@@ -8,26 +8,28 @@ from wicket.tickets import Waiting
 
 
 class Fairness(msgspec.Struct, frozen=True):
-    """The pool's virtual time `v` and the finish tag of each recently served tenant. With unit
-    weights this is round robin over the tenants with waiting tickets, a newcomer joining the
-    current round."""
+    """The pool's virtual time `v` and a finish tag per tenant: those served recently, and those
+    waiting in lanes the last grant could not see. With unit weights this is round robin over the
+    tenants with waiting tickets, a newcomer joining the current round; a tenant of a lane served
+    less often keeps its place."""
 
     v: int = 0
     tags: tuple[tuple[str, int], ...] = ()
 
-    def start(self, tenant: str) -> int:
-        """The tenant's start, max(v, its finish tag)."""
-        return self.starts([tenant])[tenant]
-
-    def starts(self, tenants: Iterable[str]) -> Mapping[str, int]:
-        """Each tenant's start, max(v, its finish tag)."""
+    def tags_of(self, tenants: Iterable[str]) -> Mapping[str, int]:
+        """Each tenant's finish tag, `v` for a tenant without one: the smallest was served longest
+        ago."""
         tags = dict(self.tags)
-        return {t: max(self.v, tags.get(t, self.v)) for t in tenants}
+        return {t: tags.get(t, self.v) for t in tenants}
 
-    def after(self, waiting: Waiting) -> "Fairness":
-        """The state after granting this ticket; a redelivery leaves it as it is."""
+    def after(self, waiting: Waiting, elsewhere: Iterable[str]) -> "Fairness":
+        """The state after granting this ticket. `elsewhere` are the tenants waiting only outside
+        the choice, in lanes it could not see: each keeps its tag, or gets the `v` it arrived at,
+        so its turn waits for it. A redelivery leaves the state as it is."""
         if waiting.grants > 0:
             return self
-        v = self.start(waiting.ticket.tenant)
-        tags = dict(self.tags) | {waiting.ticket.tenant: v + 1}
-        return Fairness(v, tuple(sorted((t, f) for t, f in tags.items() if f > v)))
+        kept = set(elsewhere)
+        tags = dict.fromkeys(kept, self.v) | dict(self.tags)
+        v = max(self.v, tags.get(waiting.ticket.tenant, self.v))
+        tags[waiting.ticket.tenant] = v + 1
+        return Fairness(v, tuple(sorted((t, f) for t, f in tags.items() if f > v or t in kept)))

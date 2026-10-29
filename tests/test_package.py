@@ -17,6 +17,7 @@ def test_every_public_name_exists():
 
 def test_the_names_a_caller_needs_are_public():
     names = {"Ticket", "Trait", "Waiting", "Permit", "Version", "PoolView", "Fairness"}
+    names |= {"Grant", "Presence", "Lane"}
     names |= {
         "Factor",
         "FairShare",
@@ -33,8 +34,13 @@ def test_the_names_a_caller_needs_are_public():
     assert names <= set(wicket.__all__)
 
 
-def test_the_postgres_tables_a_caller_migrates_are_the_three_wicket_ones():
-    assert set(metadata.tables) == {"wicket_pools", "wicket_tickets", "wicket_grants"}
+def test_the_postgres_tables_a_caller_migrates_are_the_four_wicket_ones():
+    assert set(metadata.tables) == {
+        "wicket_pools",
+        "wicket_tickets",
+        "wicket_grants",
+        "wicket_lanes",
+    }
 
 
 def test_the_postgres_module_exports_its_store_and_tables():

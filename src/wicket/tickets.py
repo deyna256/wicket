@@ -20,12 +20,13 @@ class Trait(msgspec.Struct, frozen=True):
 
 
 class Ticket(msgspec.Struct, frozen=True):
-    """A claim on a pool's capacity: the caller's row id, the tenant whose share it counts in,
-    and an immutable tuple of uniquely named traits."""
+    """A claim on a pool's capacity: the caller's row id, the tenant whose share it counts in, an
+    immutable tuple of uniquely named traits, and the lane of the pool whose workers take it."""
 
     id: str
     tenant: str
     traits: tuple[Trait, ...] = ()
+    lane: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.traits, tuple) or any(

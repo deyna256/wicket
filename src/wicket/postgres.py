@@ -48,7 +48,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.tickets import Permit, Ticket, Version, Waiting
-from wicket.view import PoolView
+from wicket.view import Grant, PoolView, Presence
 
 __all__ = ["PostgresBacklog", "PostgresLedger", "metadata"]
 
@@ -68,6 +68,7 @@ _tickets = Table(
     Column("id", Text, primary_key=True),
     Column("submission_id", UUID, nullable=False, server_default=func.gen_random_uuid()),
     Column("tenant", Text, nullable=False),
+    Column("lane", Text, nullable=False),
     Column("traits", JSONB, nullable=False),
     Column("submitted_at", TIMESTAMP(timezone=True), nullable=False),
     Column("grants", Integer, nullable=False),
@@ -80,7 +81,15 @@ _grants = Table(
     metadata,
     Column("pool", Text, nullable=False),
     Column("at", TIMESTAMP(timezone=True), nullable=False),
+    Column("lane", Text, nullable=False),
     Index("wicket_grants_pool_at", "pool", "at"),
+)
+_lanes = Table(
+    "wicket_lanes",
+    metadata,
+    Column("pool", Text, primary_key=True),
+    Column("lane", Text, primary_key=True),
+    Column("present_until", TIMESTAMP(timezone=True), nullable=False),
 )
 
 _COMMITTED = {"isolation_level": "READ COMMITTED"}
@@ -123,6 +132,7 @@ class PostgresBacklog(msgspec.Struct, frozen=True):
                     pool=pool,
                     id=ticket.id,
                     tenant=ticket.tenant,
+                    lane=ticket.lane,
                     traits=msgspec.to_builtins(ticket.traits),
                     submitted_at=func.clock_timestamp(),
                     grants=0,
@@ -173,21 +183,32 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             tickets = select(_tickets, (_tickets.c.lease_end > now).label("leased")).where(
                 _tickets.c.pool == pool
             )
+            attending = (
+                select(_lanes.c.lane, _lanes.c.present_until)
+                .where(_lanes.c.pool == pool, _lanes.c.present_until > now)
+                .order_by(_lanes.c.lane)
+            )
             history = (
-                select(_grants.c.at)
+                select(_grants.c.at, _grants.c.lane)
                 .where(_grants.c.pool == pool, _grants.c.at > now - self.retention)
                 .order_by(_grants.c.at)
             )
             known = (await connection.execute(head)).first()
             rows = (await connection.execute(tickets)).all()
-            times = await connection.scalars(history)
-            moments = tuple(at.astimezone(UTC) for at in times)
+            present = tuple(
+                Presence(row.lane, row.present_until.astimezone(UTC))
+                for row in await connection.execute(attending)
+            )
+            grants = tuple(
+                Grant(row.at.astimezone(UTC), row.lane) for row in await connection.execute(history)
+            )
         return PoolView(
             now=now,
             retention=self.retention,
             waiting=tuple(self._waiting(row) for row in rows if not row.leased),
             leased=tuple(self._permit(pool, row) for row in rows if row.leased),
-            grant_times=moments,
+            grants=grants,
+            present=present,
             fairness=msgspec.convert(known.fairness, Fairness) if known else Fairness(),
             version=known.version if known else 0,
         )
@@ -238,7 +259,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             forget = delete(_grants).where(
                 _grants.c.pool == pool, _grants.c.at <= now - self.retention
             )
-            await connection.execute(insert(_grants).values(pool=pool, at=now))
+            await connection.execute(insert(_grants).values(pool=pool, at=now, lane=row.lane))
             await connection.execute(forget)
             await connection.commit()
         return self._permit(pool, row)
@@ -279,6 +300,27 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             await connection.commit()
         return Released() if released.rowcount == 1 else LeaseLost()
 
+    async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
+        until = func.clock_timestamp() + self._seconds(ttl)
+        first = upsert(_lanes).values(pool=pool, lane=lane, present_until=until)
+        longer = first.on_conflict_do_update(
+            index_elements=[_lanes.c.pool, _lanes.c.lane],
+            # a process with a short poll never shortens the presence of one with a long poll
+            set_={
+                "present_until": func.greatest(_lanes.c.present_until, first.excluded.present_until)
+            },
+        )
+        async with self._connection(_COMMITTED) as connection:
+            await connection.execute(longer)
+            await connection.commit()
+
+    async def leave(self, pool: str, lane: str) -> None:
+        async with self._connection(_COMMITTED) as connection:
+            await connection.execute(
+                delete(_lanes).where(_lanes.c.pool == pool, _lanes.c.lane == lane)
+            )
+            await connection.commit()
+
     @contextlib.asynccontextmanager
     async def _connection(self, options: dict[str, Any]) -> AsyncGenerator[AsyncConnection, None]:
         """A connection at the isolation this call needs, whatever the engine's own."""
@@ -300,5 +342,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         traits = row.traits
         if isinstance(traits, dict):  # tickets written before traits became immutable values
             traits = [{"name": name, "value": value} for name, value in traits.items()]
-        ticket = msgspec.convert({"id": row.id, "tenant": row.tenant, "traits": traits}, Ticket)
+        ticket = msgspec.convert(
+            {"id": row.id, "tenant": row.tenant, "traits": traits, "lane": row.lane}, Ticket
+        )
         return Waiting(ticket, row.submitted_at.astimezone(UTC), row.submission_id, row.grants)

@@ -19,12 +19,13 @@ class Factor(Protocol):
 
 
 class FairShare(msgspec.Struct, frozen=True):
-    """1 for the tickets of the tenants whose turn it is, 0 for the rest."""
+    """1 for the tickets of the tenants with the smallest finish tag, whose turn it is; 0 for the
+    rest."""
 
     def scores(self, view: PoolView) -> Mapping[str, float]:
-        starts = view.fairness.starts({w.ticket.tenant for w in view.waiting})
-        due = min(starts.values(), default=0)
-        return {w.ticket.id: float(starts[w.ticket.tenant] == due) for w in view.waiting}
+        tags = view.fairness.tags_of({w.ticket.tenant for w in view.waiting})
+        due = min(tags.values(), default=0)
+        return {w.ticket.id: float(tags[w.ticket.tenant] == due) for w in view.waiting}
 
 
 class Age(msgspec.Struct, frozen=True):

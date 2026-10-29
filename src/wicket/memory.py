@@ -19,7 +19,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.tickets import Permit, Ticket, Version, Waiting
-from wicket.view import PoolView
+from wicket.view import Grant, PoolView, Presence
 
 
 class _Lease(msgspec.Struct, frozen=True):
@@ -28,14 +28,15 @@ class _Lease(msgspec.Struct, frozen=True):
 
 
 class _Pool:
-    """One pool's tickets, leases, grant history, fairness and version."""
+    """One pool's tickets, leases, grant history, lane presences, fairness and version."""
 
     def __init__(self) -> None:
         self.version: Version = 0
         self.fairness = Fairness()
         self.tickets: dict[str, Waiting] = {}  # every ticket, leased or not, with its grants so far
         self.leases: dict[str, _Lease] = {}
-        self.grant_times: list[datetime] = []
+        self.grants: list[Grant] = []
+        self.present: dict[str, datetime] = {}  # lane: until
 
     def leased(self, ticket_id: str, now: datetime) -> bool:
         return ticket_id in self.leases and self.leases[ticket_id].end > now
@@ -91,13 +92,16 @@ class MemoryLedger(msgspec.Struct, frozen=True):
 
     async def view(self, pool: str) -> PoolView:
         held, now = self.state._pool(pool), self.state.clock()
-        held.grant_times = [at for at in held.grant_times if at > now - self.state.retention]
+        held.grants = [g for g in held.grants if g.at > now - self.state.retention]
         return PoolView(
             now=now,
             retention=self.state.retention,
             waiting=tuple(w for id, w in held.tickets.items() if not held.leased(id, now)),
             leased=tuple(lease.permit for lease in held.leases.values() if lease.end > now),
-            grant_times=tuple(held.grant_times),
+            grants=tuple(held.grants),
+            present=tuple(
+                Presence(lane, end) for lane, end in sorted(held.present.items()) if end > now
+            ),
             fairness=held.fairness,
             version=held.version,
         )
@@ -118,7 +122,7 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         permit = Permit(pool, current, now, held.version)
         held.tickets[ticket_id] = msgspec.structs.replace(current, grants=current.grants + 1)
         held.leases[ticket_id] = _Lease(permit, now + lease)
-        held.grant_times.append(now)
+        held.grants.append(Grant(now, current.ticket.lane))
         held.fairness = fairness
         return permit
 
@@ -137,3 +141,10 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         del held.tickets[id]
         del held.leases[id]
         return Released()
+
+    async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
+        present, until = self.state._pool(pool).present, self.state.clock() + ttl
+        present[lane] = max(present.get(lane, until), until)
+
+    async def leave(self, pool: str, lane: str) -> None:
+        self.state._pool(pool).present.pop(lane, None)

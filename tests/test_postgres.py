@@ -6,6 +6,8 @@ conftest.py)."""
 import asyncio
 import contextlib
 import random
+import sys
+from asyncio.subprocess import PIPE
 from collections.abc import AsyncGenerator, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -20,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 from sqlalchemy.util import await_
 
 from wicket.fairness import Fairness
-from wicket.limits import Concurrency, Rate
+from wicket.limits import Concurrency, Lane, Rate
 from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.priority import FairShare, Priority
@@ -71,7 +73,7 @@ async def grant_first(
         first,
         version=view.version,
         lease=lease,
-        fairness=view.fairness.after(first),
+        fairness=view.fairness.after(first, ()),
     )
 
 
@@ -132,7 +134,7 @@ async def test_submission_id_migration_preserves_existing_tickets(engine: AsyncE
     assert added.submission_id.version == 4
     assert isinstance(
         await ledger.grant(
-            "p", added, version=fresh.version, lease=LEASE, fairness=fresh.fairness.after(added)
+            "p", added, version=fresh.version, lease=LEASE, fairness=fresh.fairness.after(added, ())
         ),
         Permit,
     )
@@ -147,13 +149,13 @@ async def test_a_ticket_held_by_an_open_caller_transaction_is_missing_at_once(en
         await PostgresBacklog(caller).withdraw("p", "1")  # left open
         held = await asyncio.wait_for(
             ledger.grant(
-                "p", one, version=view.version, lease=LEASE, fairness=view.fairness.after(one)
+                "p", one, version=view.version, lease=LEASE, fairness=view.fairness.after(one, ())
             ),
             1,
         )
         next_one = await asyncio.wait_for(
             ledger.grant(
-                "p", two, version=view.version, lease=LEASE, fairness=view.fairness.after(two)
+                "p", two, version=view.version, lease=LEASE, fairness=view.fairness.after(two, ())
             ),
             1,
         )
@@ -186,16 +188,16 @@ async def test_a_replacement_committed_during_a_grant_is_missing(engine: AsyncEn
             stale.waiting[0],
             version=stale.version,
             lease=LEASE,
-            fairness=stale.fairness.after(stale.waiting[0]),
+            fairness=stale.fairness.after(stale.waiting[0], ()),
         )
     finally:
         event.remove(engine.sync_engine, "before_cursor_execute", replace_before_take)
     view = await ledger.view("p")
     assert replaced and answer == Missing()
-    assert (view.version, view.fairness, view.grant_times, view.leased) == (
+    assert (view.version, view.fairness, view.grants, view.leased) == (
         stale.version,
         stale.fairness,
-        stale.grant_times,
+        stale.grants,
         (),
     )
     assert view.waiting[0].ticket == Ticket("1", "replacement")
@@ -249,7 +251,7 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
                     chosen,
                     version=first.version,
                     lease=LEASE,
-                    fairness=first.fairness.after(chosen),
+                    fairness=first.fairness.after(chosen, ()),
                 )
             )
             assert isinstance(granted, Permit)
@@ -263,7 +265,7 @@ async def test_a_view_does_not_see_a_grant_committed_during_it(
         finally:
             event.remove(engine.sync_engine, "before_cursor_execute", grant_in_between)
     assert fired
-    assert (view.version, view.leased, view.grant_times) == (first.version, (), ())
+    assert (view.version, view.leased, view.grants) == (first.version, (), ())
 
 
 @pytest.mark.parametrize("level", ["SERIALIZABLE", "REPEATABLE READ"])
@@ -340,7 +342,12 @@ async def test_every_moment_comes_back_at_utc_whatever_the_session_zone(url: URL
         view = await ledger.view("p")
     assert isinstance(granted, Permit)
     (leased,), (waiting,) = view.leased, view.waiting
-    moments = [granted.granted_at, granted.waiting.submitted_at, view.now, *view.grant_times]
+    moments = [
+        granted.granted_at,
+        granted.waiting.submitted_at,
+        view.now,
+        *(grant.at for grant in view.grants),
+    ]
     moments += [leased.granted_at, leased.waiting.submitted_at, waiting.submitted_at]
     assert {moment.tzinfo for moment in moments} == {UTC}
 
@@ -407,7 +414,7 @@ async def test_a_delayed_renewal_cannot_revive_capacity_used_by_another_grant(
                             chosen,
                             version=stale.version,
                             lease=LEASE,
-                            fairness=stale.fairness.after(chosen),
+                            fairness=stale.fairness.after(chosen, ()),
                         )
                     )
                     blocked = tasks.create_task(
@@ -456,7 +463,7 @@ async def test_a_renewal_checks_expiry_after_waiting_for_the_pool(engine: AsyncE
     assert await ledger.view("p") == expired
 
 
-async def test_grant_times_come_back_in_order_after_old_ones_are_deleted(url: URL):
+async def test_grants_come_back_in_order_after_old_ones_are_deleted(url: URL):
     no_index = settings(url, enable_indexscan="off", enable_bitmapscan="off")
     async with emptied(url, EPOCH, connect_args=no_index) as engine:
         await submit(engine, *map(str, range(25)))
@@ -467,7 +474,7 @@ async def test_grant_times_come_back_in_order_after_old_ones_are_deleted(url: UR
             async with engine.connect() as connection:  # new rows reuse the deleted ones' space
                 connection = await connection.execution_options(isolation_level="AUTOCOMMIT")
                 await connection.execute(text("vacuum wicket_grants"))
-        times = (await ledger.view("p")).grant_times
+        times = tuple(grant.at for grant in (await ledger.view("p")).grants)
         assert len(times) == 9 and list(times) == sorted(times)
 
 
@@ -547,7 +554,11 @@ async def test_a_grant_on_a_pool_with_no_row_at_another_version_is_a_conflict(en
     ledger = PostgresLedger(engine, HOUR)
     view = await ledger.view("p")
     stale = await ledger.grant(
-        "p", view.waiting[0], version=5, lease=LEASE, fairness=view.fairness.after(view.waiting[0])
+        "p",
+        view.waiting[0],
+        version=5,
+        lease=LEASE,
+        fairness=view.fairness.after(view.waiting[0], ()),
     )
     assert stale == Conflict()
 
@@ -602,3 +613,99 @@ async def test_pools_of_several_processes_never_exceed_the_limit(url: URL):
         left = (await PostgresLedger(engine, HOUR).view("p")).waiting
     assert peak == 2
     assert left == ()
+
+
+@pytest.mark.parametrize("outcome", ["commit", "rollback"])
+async def test_a_ticket_held_by_a_caller_transaction_holds_back_another_lane_only_while_held(
+    engine: AsyncEngine, outcome: str
+):
+    # a1 sorts before b1, so with equal tags and submit times alice's ticket is the winner
+    async with AsyncSession(engine) as session:
+        await PostgresBacklog(session).submit("p", Ticket("a1", "alice", lane="m"))
+        await PostgresBacklog(session).submit("p", Ticket("b1", "bob", lane="g"))
+        await session.commit()
+    ledger, order = PostgresLedger(engine, HOUR), []
+
+    async def work(lane: str) -> None:
+        serving = Pool(
+            ledger,
+            "p",
+            lane=Lane(lane),
+            priority=Priority((FairShare(), 1)),
+            lease=HOUR,
+            poll=timedelta(milliseconds=20),
+        )
+        async with serving.permit() as permit:
+            order.append(permit.waiting.ticket.id)
+
+    async with AsyncSession(engine) as caller:
+        await PostgresBacklog(caller).withdraw("p", "a1")  # holds a1's row, left open
+        mentor = asyncio.create_task(work("m"))
+        while not (await ledger.view("p")).present:  # mentor is present before generation looks
+            await asyncio.sleep(0.01)
+        generation = asyncio.create_task(work("g"))
+        await asyncio.sleep(0.3)
+        assert order == []  # mentor gets Missing, generation yields to a1
+        await (caller.commit() if outcome == "commit" else caller.rollback())
+    if outcome == "commit":
+        await asyncio.wait_for(generation, 2)
+        mentor.cancel()
+        await asyncio.gather(mentor, return_exceptions=True)
+        assert order == ["b1"]
+    else:
+        await asyncio.wait_for(asyncio.gather(mentor, generation), 2)
+        assert order == ["a1", "b1"]  # a1's own lane takes it first, then generation goes on
+
+
+WORKER = """
+import asyncio, sys
+from datetime import timedelta
+from sqlalchemy.ext.asyncio import create_async_engine
+from wicket import FairShare, Lane, Pool, Priority, Rate
+from wicket.postgres import PostgresLedger
+
+async def main(url: str, lane: str) -> None:
+    engine, minute = create_async_engine(url), timedelta(minutes=1)
+    pool = Pool(
+        PostgresLedger(engine, timedelta(hours=1)), "p",
+        lane=Lane(lane, Rate(3, per=minute)), limits=(Rate(5, per=minute),),
+        priority=Priority((FairShare(), 1)), lease=timedelta(hours=1),
+        poll=timedelta(milliseconds=20),
+    )
+    while True:
+        async with pool.permit() as permit:
+            print(permit.waiting.ticket.id, flush=True)
+
+asyncio.run(main(*sys.argv[1:]))
+"""
+
+
+async def test_lanes_in_several_os_processes_never_exceed_the_pool_or_lane_limits(url: URL):
+    # the test clock stands still, so every grant falls in one minute of both rates
+    async with emptied(url, EPOCH) as engine:
+        async with AsyncSession(engine) as session:
+            for n in range(6):
+                for lane in "mg":
+                    ticket = Ticket(f"{lane}{n}", f"t{n % 2}", lane=lane)
+                    await PostgresBacklog(session).submit("p", ticket)
+            await session.commit()
+        address = url.render_as_string(hide_password=False)
+        workers = [
+            await asyncio.create_subprocess_exec(
+                sys.executable, "-c", WORKER, address, lane, stdout=PIPE
+            )
+            for lane in "mmg"  # two processes of one lane, one of the other
+        ]
+        ledger = PostgresLedger(engine, HOUR)
+        async with asyncio.timeout(30):
+            while len((await ledger.view("p")).grants) < 5:
+                await asyncio.sleep(0.05)
+        await asyncio.sleep(0.5)  # time enough for a sixth grant, if the limits let one through
+        for worker in workers:
+            worker.terminate()
+        outputs = [(await worker.communicate())[0].decode().split() for worker in workers]
+        grants = (await ledger.view("p")).grants
+    started = [id for output in outputs for id in output]
+    assert len(started) == len(set(started)) == len(grants) == 5
+    assert sum(id.startswith("m") for id in started) <= 3
+    assert sum(id.startswith("g") for id in started) <= 3

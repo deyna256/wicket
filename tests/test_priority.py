@@ -47,9 +47,16 @@ def drain(
                 return order, view.fairness
             case Waiting() as chosen:
                 order.append(chosen.ticket.tenant)
-                view = msgspec.structs.replace(
-                    view.without(chosen.ticket.id), fairness=view.fairness.after(chosen)
-                )
+                view = granted(view, view, chosen)
+
+
+def granted(view: PoolView, among: PoolView, chosen: Waiting) -> PoolView:
+    """The pool after granting `chosen` from `among`, a part of `view`: fairness sees every tenant
+    waiting in `view`."""
+    elsewhere = {w.ticket.tenant for w in view.waiting} - {w.ticket.tenant for w in among.waiting}
+    return msgspec.structs.replace(
+        view.without(chosen.ticket.id), fairness=view.fairness.after(chosen, elsewhere)
+    )
 
 
 def tickets(tenant: str, count: int, start: float = 0, tier: float | None = None) -> list[Waiting]:
@@ -80,28 +87,52 @@ def test_a_tenant_back_from_a_break_gets_no_extra_turns():
 
 
 def test_a_redelivery_does_not_cost_its_tenant_a_turn():
-    fairness = Fairness().after(ticket("a0", "a"))
-    assert fairness.after(ticket("a1", "a", grants=1)) == fairness
+    fairness = Fairness().after(ticket("a0", "a"), ())
+    assert fairness.after(ticket("a1", "a", grants=1), ()) == fairness
 
 
-def test_virtual_time_never_falls_and_no_tag_stays_at_or_below_it():
+def test_virtual_time_never_falls_and_only_waiting_tenants_keep_a_tag_at_or_below_it():
     rng = random.Random(7)
     fairness, last = Fairness(), 0
     for n in range(2000):
-        fairness = fairness.after(ticket(str(n), rng.choice("abcdefgh")))
+        waiting = set(rng.sample("abcdefgh", rng.randint(0, 8)))
+        fairness = fairness.after(ticket(str(n), rng.choice("abcdefgh")), waiting)
         assert fairness.v >= last
-        assert all(finish > fairness.v for _, finish in fairness.tags)
+        assert all(finish > fairness.v or t in waiting for t, finish in fairness.tags)
+        assert waiting <= {t for t, _ in fairness.tags}
         last = fairness.v
 
 
-def test_starts_equals_start_for_every_tenant():
-    rng = random.Random(3)
-    fairness, tenants = Fairness(), "abcdefgh"
-    for n in range(300):
-        fairness = fairness.after(ticket(str(n), rng.choice(tenants)))
-        assert fairness.starts([*tenants, "new"]) == {
-            t: fairness.start(t) for t in [*tenants, "new"]
-        }
+def test_a_waiting_tenant_gets_a_tag_at_the_new_virtual_time_and_one_gone_loses_it():
+    fairness = Fairness().after(ticket("a0", "a"), {"a", "b"})
+    assert fairness.tags_of(["a", "b", "never"]) == {"a": 1, "b": 0, "never": 0}
+    for n in range(3):
+        fairness = fairness.after(ticket(f"c{n}", "c"), {"b", "c"})
+    assert dict(fairness.tags) == {
+        "b": 0,
+        "c": 3,
+    }  # a has nothing waiting: dropped once v passed it
+
+
+def test_tenants_of_a_slower_lane_take_turns_while_a_faster_lane_takes_most_grants():
+    # one shared Fairness; every fourth grant goes to the slower lane's tenants a and c
+    slow = {w.ticket.id for w in tickets("a", 10) + tickets("c", 10, start=100)}
+    view = PoolView(
+        now=EPOCH + HOUR,
+        retention=HOUR,
+        waiting=tuple(tickets("a", 10) + tickets("c", 10, start=100) + tickets("b", 40, start=2)),
+    )
+    order = []
+    for step in range(40):
+        among = msgspec.structs.replace(
+            view, waiting=tuple(w for w in view.waiting if (w.ticket.id in slow) == (step % 4 == 3))
+        )
+        chosen = Priority((FairShare(), 1)).first(among)
+        assert isinstance(chosen, Waiting)
+        if step % 4 == 3:
+            order.append(chosen.ticket.tenant)
+        view = granted(view, among, chosen)
+    assert "".join(order) == "acacacacac"
 
 
 def test_within_a_tenant_the_oldest_goes_first():
@@ -200,7 +231,7 @@ def test_a_trait_factor_reads_its_named_trait_among_other_traits():
 
 
 def test_fair_share_scores_one_for_the_tenants_whose_turn_it_is():
-    fairness = Fairness().after(ticket("a0", "a"))
+    fairness = Fairness().after(ticket("a0", "a"), ())
     view = PoolView(
         now=EPOCH,
         retention=HOUR,

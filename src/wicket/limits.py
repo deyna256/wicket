@@ -1,5 +1,5 @@
 """Whether a pool may lease one more ticket now. At the same version a limit may turn from refuse
-to admit, never the reverse; it reads only leased tickets, grant times, now and retention."""
+to admit, never the reverse; it reads only leased tickets, grants, now and retention."""
 
 from datetime import timedelta
 from typing import Protocol
@@ -45,4 +45,25 @@ class Rate(msgspec.Struct, frozen=True):
                 f"{view.retention}; configure the store's retention to at least {self.per}"
             )
         since = view.now - self.per
-        return sum(1 for at in view.grant_times if at > since) < self.n
+        return sum(1 for grant in view.grants if grant.at > since) < self.n
+
+
+class Lane:
+    """One lane of a pool and the limits on it alone, which count only its leased tickets and
+    grants. A pool serves one lane and grants only its tickets; it is not one of the pool's limits.
+    A plain class, like Priority: a Struct cannot take its limits as arguments; it never changes
+    after construction."""
+
+    __slots__ = ("_limits", "_name")
+
+    def __init__(self, name: str, *limits: Limit) -> None:
+        self._name = name
+        self._limits = limits
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    def admits(self, view: PoolView) -> bool:
+        own = view.in_lanes(self._name)
+        return all(limit.admits(own) for limit in self._limits)
