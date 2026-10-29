@@ -685,6 +685,37 @@ async def test_a_pool_granting_at_once_and_a_lane_with_nothing_waiting_write_no_
     assert (plain.attendance, idle.attendance) == ([], [])
 
 
+class SlowGrant(Scripted):
+    """A ledger whose grants wait until the test lets them through."""
+
+    def __init__(self, ledger: MemoryLedger) -> None:
+        super().__init__(ledger)
+        self.through = asyncio.Event()
+
+    async def grant(
+        self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
+    ) -> Permit | Conflict | Missing:
+        await self.through.wait()
+        return await super().grant(pool, waiting, version=version, lease=lease, fairness=fairness)
+
+
+async def test_a_lane_is_seen_while_its_grant_is_on_its_way():
+    backlog, ledger = store()
+    await backlog.submit("p", Ticket("bob", "bob", lane="g"))
+    await asyncio.sleep(1)
+    for n in range(3):
+        await backlog.submit("p", Ticket(f"alice{n}", "alice", lane="m"))
+    slow, order = SlowGrant(ledger), []
+    bob = asyncio.create_task(work(pool(slow, lane=Lane("g")), order, 0))
+    await asyncio.sleep(0)  # bob's worker has read the pool and is granting
+    alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
+    await asyncio.sleep(1.5)  # within bob's presence, 2 * poll from his pass
+    assert order == []  # mentor yields to bob, due first, whose grant is still on its way
+    slow.through.set()
+    await asyncio.gather(bob, alice)
+    assert order == ["bob", "alice0"]
+
+
 async def test_a_lane_waiting_at_the_pool_limit_is_seen_by_a_lane_that_appears_later():
     backlog, ledger = store()
     minute, slow = (Rate(10, per=timedelta(minutes=1)),), timedelta(seconds=10)

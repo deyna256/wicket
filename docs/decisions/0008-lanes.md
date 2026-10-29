@@ -20,11 +20,12 @@ up to its own ceiling, but in one scheduler that sees every class.
 - **A `Pool` serves one `Lane(name, *limits)`** and grants only its tickets. The lane's limits count
   only its leased tickets and grants; the pool's `limits` count every lane. `Pool` serves `Lane("")`
   unless given another.
-- **Fairness is judged across every lane that can take work.** A worker whose pass ends without a
-  grant makes its lane present in the store (`Ledger.attend`, for `2 × poll`) while the lane has a
-  waiting ticket that its own limits let it take; it leaves once it has none. So a lane waiting at
-  the pool's limit is present before another lane appears, and that lane's first grants yield to
-  it. It chooses among its own lane's tickets and every present lane's, and grants only if the
+- **Fairness is judged across every lane that can take work.** A worker makes its lane present in
+  the store (`Ledger.attend`, for `2 × poll`) while the lane has a waiting ticket that its own limits
+  let it take, and leaves once it has none. When another lane shows in its view (a waiting or leased
+  ticket, a recent grant or a presence), it does so before it tries to grant, so the other lane sees
+  it while its grant is on its way; when its lane is alone, it does so after a pass without a grant,
+  so a lane waiting at the pool's limit is present before another lane appears. It chooses among its own lane's tickets and every present lane's, and grants only if the
   winner is its own; otherwise it yields, and the winner's lane takes it. Presences never change
   the version: they steer which ticket is chosen, never whether one may start, which the version
   check keeps deciding. As in HTB, only a lane with a
@@ -63,9 +64,10 @@ up to its own ceiling, but in one scheduler that sees every class.
 
 ## Consequences
 
-- About one presence write per lane every two passes while it has a candidate and its workers
-  wait, at the pool's limit or behind another lane's turn; a pool of one lane writes them too while
-  it waits at a limit. None while a lane is granting or idle.
+- About one presence write per lane every two passes while it has a candidate and either another
+  lane shows in the pool or its workers wait at a limit; none for a lone lane that grants at once,
+  nor for an idle one.
+- A worker whose grant takes longer than `2 × poll` stops being seen until its next pass.
 - Renewals in every lane change one version, so lanes conflict more often.
 - A view reads every lane's tickets: merging pools multiplies the view size
   ([decision 2](0002-pure-decision-over-a-store.md)).

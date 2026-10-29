@@ -94,26 +94,29 @@ class Pool:
         """The permit, and the event loop's time just before the grant that made it."""
         while True:
             view = await self._ledger.view(self._name)
+            alone = view.in_lanes(self._lane.name) == view
+            if not alone:  # another lane may choose while this grant is on its way: be seen first
+                await self._attend(view)
             match await self._attempt(view):
                 case (Permit() as permit, float() as since):
                     return permit, since
                 case Conflict():
                     continue  # a grant or renewal changed the version: read again at once
                 case NoTicket():
-                    await self._attend(view)
+                    if alone:  # waiting at a limit: be seen by a lane that comes later
+                        await self._attend(view)
                     seconds = self._poll.total_seconds()
                     await asyncio.sleep(random.uniform(seconds / 2, seconds))
 
     async def _attend(self, view: PoolView) -> None:
-        """After a pass without a grant: keep this lane present while it has a ticket its own limits
-        let it take, so that a lane appearing later sees it waiting; leave once it has none. A
-        presence never changes the version."""
+        """Keep this lane present while it has a ticket its own limits let it take; leave once it
+        has none. A presence never changes the version."""
         own = view.in_lanes(self._lane.name)
         candidate = bool(own.waiting) and self._lane.admits(view)
         if candidate:
             if all(presence.until <= view.now + self._poll for presence in own.present):
                 await self._ledger.attend(self._name, self._lane.name, ttl=2 * self._poll)
-        elif not candidate and own.present:
+        elif own.present:
             await self._ledger.leave(self._name, self._lane.name)
 
     async def _attempt(self, view: PoolView) -> tuple[Permit, float] | Conflict | NoTicket:
