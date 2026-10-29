@@ -21,16 +21,16 @@ up to its own ceiling, but in one scheduler that sees every class.
   only its leased tickets and grants; the pool's `limits` count every lane. `Pool` serves `Lane("")`
   unless given another.
 - **Fairness is judged across every lane that can take work.** A worker makes its lane present in
-  the store (`Ledger.attend`, for `2 × poll`) while the lane has a waiting ticket that its own limits
-  let it take, and leaves once it has none. When another lane shows in its view (a waiting or leased
-  ticket, a recent grant or a presence), it does so before it tries to grant, so the other lane sees
-  it while its grant is on its way; when its lane is alone, it does so after a pass without a grant,
-  so a lane waiting at the pool's limit is present before another lane appears. It chooses among its own lane's tickets and every present lane's, and grants only if the
-  winner is its own; otherwise it yields, and the winner's lane takes it. Presences never change
-  the version: they steer which ticket is chosen, never whether one may start, which the version
-  check keeps deciding. As in HTB, only a lane with a
-  backlog under its own ceiling competes; as in Temporal's pollers, a worker's presence expires
-  rather than being withdrawn.
+  the store (`Ledger.attend`, for `2 × poll`) while the lane has a waiting ticket that its own
+  limits let it take, and leaves once it has none. When another lane shows in its view (a waiting or
+  leased ticket, a recent grant or a presence), it does so before it tries to grant, so the other
+  lane sees it while its grant is on its way; when its lane is alone, it does so after a pass
+  without a grant, so a lane waiting at the pool's limit is present before another lane appears. It
+  chooses among its own lane's tickets and every present lane's, and grants only if the winner is
+  its own; otherwise it yields, and the winner's lane takes it. Presences never change the version:
+  they steer which ticket is chosen, never whether one may start, which the version check keeps
+  deciding. As in HTB, only a lane with a backlog under its own ceiling competes; as in Temporal's
+  pollers, a worker's presence expires rather than being withdrawn.
 - **Every waiting tenant keeps its fairness tag, and ties go to the one served longest ago**
   ([decision 4](0004-start-time-fair-queuing.md)), so tenants of a lane served less often still take
   turns.
