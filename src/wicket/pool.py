@@ -94,22 +94,23 @@ class Pool:
         """The permit, and the event loop's time just before the grant that made it."""
         while True:
             view = await self._ledger.view(self._name)
-            await self._attend(view)
             match await self._attempt(view):
                 case (Permit() as permit, float() as since):
                     return permit, since
                 case Conflict():
                     continue  # a grant or renewal changed the version: read again at once
                 case NoTicket():
+                    await self._attend(view)
                     seconds = self._poll.total_seconds()
                     await asyncio.sleep(random.uniform(seconds / 2, seconds))
 
     async def _attend(self, view: PoolView) -> None:
-        """Keep this lane present while it has a ticket its own limits let it take and another lane
-        shows in the view; leave once it has none. A presence never changes the version."""
+        """After a pass without a grant: keep this lane present while it has a ticket its own limits
+        let it take, so that a lane appearing later sees it waiting; leave once it has none. A
+        presence never changes the version."""
         own = view.in_lanes(self._lane.name)
         candidate = bool(own.waiting) and self._lane.admits(view)
-        if candidate and own != view:  # another lane's ticket, grant or presence is in the view
+        if candidate:
             if all(presence.until <= view.now + self._poll for presence in own.present):
                 await self._ledger.attend(self._name, self._lane.name, ttl=2 * self._poll)
         elif not candidate and own.present:
@@ -119,6 +120,7 @@ class Pool:
         if not (self._lane.admits(view) and all(limit.admits(view) for limit in self._limits)):
             return NoTicket()
         lane = self._lane.name
+        tenants = {w.ticket.tenant for w in view.waiting}
         choice = view.in_lanes(lane, *(presence.lane for presence in view.present))
         while True:
             match self._priority.first(choice):
@@ -127,15 +129,13 @@ class Pool:
                 case Waiting() as chosen if chosen.ticket.lane != lane:
                     return NoTicket()  # another lane's turn: its worker takes it
                 case Waiting() as chosen:
-                    seen = {w.ticket.tenant for w in choice.waiting}
-                    elsewhere = {w.ticket.tenant for w in view.waiting} - seen
                     since = asyncio.get_running_loop().time()
                     answer = await self._ledger.grant(
                         self._name,
                         chosen,
                         version=view.version,
                         lease=self._lease,
-                        fairness=view.fairness.after(chosen, elsewhere),
+                        fairness=view.fairness.after(chosen, tenants),
                     )
                     match answer:
                         case Permit() as permit:

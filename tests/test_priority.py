@@ -53,9 +53,9 @@ def drain(
 def granted(view: PoolView, among: PoolView, chosen: Waiting) -> PoolView:
     """The pool after granting `chosen` from `among`, a part of `view`: fairness sees every tenant
     waiting in `view`."""
-    elsewhere = {w.ticket.tenant for w in view.waiting} - {w.ticket.tenant for w in among.waiting}
+    tenants = {w.ticket.tenant for w in view.waiting}
     return msgspec.structs.replace(
-        view.without(chosen.ticket.id), fairness=view.fairness.after(chosen, elsewhere)
+        view.without(chosen.ticket.id), fairness=view.fairness.after(chosen, tenants)
     )
 
 
@@ -142,9 +142,32 @@ def test_within_a_tenant_the_oldest_goes_first():
     assert FAIR.first(view) == ticket("old", "a", 1)
 
 
-def test_an_empty_priority_grants_in_submission_order():
+def test_an_empty_priority_takes_tenants_in_turn_each_in_submission_order():
     order, _ = drain(Priority(), [ticket("x", "b", 2), ticket("y", "a", 1), ticket("z", "b", 3)])
     assert order == ["a", "b", "b"]
+    order, _ = drain(Priority(), tickets("a", 3) + tickets("b", 3, start=10))
+    assert order == ["a", "b"] * 3
+
+
+def test_tenants_passed_over_by_a_heavier_factor_still_take_turns_among_themselves():
+    # bob's tier wins three slots of every four; alice and carol share the fourth in turn
+    by_tier = Priority((TraitFactor("tier"), 2), (FairShare(), 1))
+    view = PoolView(
+        now=EPOCH + HOUR,
+        retention=HOUR,
+        waiting=tuple(tickets("alice", 4) + tickets("carol", 4, start=10)),
+    )
+    order = []
+    for round in range(4):
+        bobs = tuple(ticket(f"bob{round}{k}", "bob", 100 + k, tier=1.0) for k in range(3))
+        view = msgspec.structs.replace(view, waiting=view.waiting + bobs)
+        for _ in range(4):
+            chosen = by_tier.first(view)
+            assert isinstance(chosen, Waiting)
+            if chosen.ticket.tenant != "bob":
+                order.append(chosen.ticket.tenant)
+            view = granted(view, view, chosen)
+    assert order == ["alice", "carol"] * 2
 
 
 @pytest.mark.parametrize(
