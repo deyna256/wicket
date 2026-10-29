@@ -23,6 +23,7 @@ try:
         exc,
         func,
         insert,
+        literal_column,
         or_,
         select,
         update,
@@ -94,6 +95,7 @@ _lanes = Table(
 
 _COMMITTED = {"isolation_level": "READ COMMITTED"}
 _SNAPSHOT = {"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
+_ENDED = literal_column("'-infinity'::timestamptz")  # a lane's row while it is absent
 
 
 class _Reach(msgspec.Struct, frozen=True):
@@ -301,24 +303,31 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         return Released() if released.rowcount == 1 else LeaseLost()
 
     async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
-        until = func.clock_timestamp() + self._seconds(ttl)
-        first = upsert(_lanes).values(pool=pool, lane=lane, present_until=until)
-        longer = first.on_conflict_do_update(
-            index_elements=[_lanes.c.pool, _lanes.c.lane],
-            # read the clock again once the row is locked: `until` was taken before any wait
-            set_={"present_until": until},
-            # rechecked after a concurrent attend commits, so workers attending at once write once;
-            # a presence ending later, as a longer poll's, is left as it is
-            where=_lanes.c.present_until <= func.clock_timestamp() + self._seconds(ttl / 2),
+        # The row first, ended: an insert takes its values before any wait, so it sets no time.
+        row = upsert(_lanes).values(pool=pool, lane=lane, present_until=_ENDED)
+        # Then the time, read once the row is locked; the condition is rechecked after a concurrent
+        # attend commits, so workers attending at once write once, and a longer presence stays.
+        renew = (
+            update(_lanes)
+            .where(
+                _lanes.c.pool == pool,
+                _lanes.c.lane == lane,
+                _lanes.c.present_until <= func.clock_timestamp() + self._seconds(ttl / 2),
+            )
+            .values(present_until=func.clock_timestamp() + self._seconds(ttl))
         )
         async with self._connection(_COMMITTED) as connection:
-            await connection.execute(longer)
+            await connection.execute(row.on_conflict_do_nothing())
+            await connection.execute(renew)
             await connection.commit()
 
     async def leave(self, pool: str, lane: str) -> None:
         async with self._connection(_COMMITTED) as connection:
+            # ended, not deleted: the row stays for the next attend to renew
             await connection.execute(
-                delete(_lanes).where(_lanes.c.pool == pool, _lanes.c.lane == lane)
+                update(_lanes)
+                .where(_lanes.c.pool == pool, _lanes.c.lane == lane)
+                .values(present_until=_ENDED)
             )
             await connection.commit()
 
