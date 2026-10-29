@@ -30,8 +30,8 @@ ticket is, and how importance becomes a choice.
   a trait, not the trait itself. The caller turns its own data into traits where it submits, as
   Temporal takes a priority key and Slurm a QOS priority rather than the job's data. The worker reads
   the work from the caller's row, so nothing else needs to travel.
-- **Pools do not nest.** Capacity is split between pools, as Kubernetes API Priority and Fairness
-  gives each priority level its own seats.
+- **Pools do not nest;** kinds of work sharing one capacity are lanes of a pool
+  ([decision 8](0008-lanes.md)), which also requires one `Priority` for all of them.
 
 ## Alternatives
 

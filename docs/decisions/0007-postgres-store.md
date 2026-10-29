@@ -23,6 +23,9 @@ is usually SQLAlchemy.
   `wicket_tickets` and `wicket_grants`. wicket ships no migrations and creates no tables.
 - **Traits are a JSONB array of name/value records**, preserving their tuple order. The reader also
   accepts the name-to-number objects written by 0.1.0 and validates both formats through `Ticket`.
+- **Lanes:** `lane` on `wicket_tickets` and `wicket_grants`, and `wicket_lanes`, a presence per pool
+  and lane, extended with `GREATEST` so that a short poll never shortens a long one's presence
+  ([decision 8](0008-lanes.md)).
 - **The store's clock only**: a view reads `now()`, every other call `clock_timestamp()`, and times
   are read back as UTC.
 - **Submission identity is a UUID column with `gen_random_uuid()` as its default.** A grant matches

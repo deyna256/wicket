@@ -136,6 +136,30 @@ ticket = Ticket("task-1", "alice", traits=(Trait("tier", 1.0), Trait("urgent", 0
 tickets by that named value, or `0` when absent. A ticket takes a tuple of traits with unique names;
 neither the tuple nor its traits can change. Tickets encode and decode with msgspec without hooks.
 
+## Lanes
+
+Kinds of work that share one capacity are lanes of one pool: each lane has limits of its own, the
+pool's limits count them all, and a freed slot goes to the tenant whose turn it is in any lane.
+
+```python
+from wicket import Lane
+
+await backlog.submit("ai", Ticket(id="r1", tenant="alice", lane="mentor"))
+
+mentor = Pool(
+    ledger,
+    "ai",
+    lane=Lane("mentor", Rate(8, per=timedelta(minutes=1))),
+    limits=(Rate(10, per=timedelta(minutes=1)),),
+    priority=Priority((FairShare(), 1)),
+    lease=timedelta(minutes=2),
+    poll=timedelta(seconds=1),
+)
+```
+
+Every process serving a pool must configure the same pool limits and priority; the rules and costs
+are in [decision 8](https://github.com/deyna256/wicket/blob/main/docs/decisions/0008-lanes.md).
+
 ## PostgreSQL
 
 The extra brings SQLAlchemy; bring your driver, asyncpg or psycopg.
