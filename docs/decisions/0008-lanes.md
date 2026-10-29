@@ -69,8 +69,9 @@ up to its own ceiling, but in one scheduler that sees every class.
 - About one presence write per lane per `poll` while it has a candidate, whatever its grant rate or
   number of workers: a presence lasts `2 × poll`, and `attend` renews it only when it would end
   within `poll`, a condition the store checks atomically. Workers that read the same old presence
-  still each send an `attend` (up to one per worker per `poll`), and in PostgreSQL they queue
-  briefly on the lane's row, but only the first writes. Workers of one lane with different polls
+  still each send an `attend` (up to one per worker per `poll`; two statements each in PostgreSQL),
+  and they queue briefly on the lane's row, but only the first writes; `leave` likewise writes only
+  a presence still live. Workers of one lane with different polls
   renew it on their own schedules (polls of 1 s and 2 s wrote it twice where one poll writes once),
   so keep a lane's polls alike. A pool of one lane pays this too; an idle lane writes nothing.
 - A worker whose grant takes longer than `2 × poll` stops being seen until its next pass.

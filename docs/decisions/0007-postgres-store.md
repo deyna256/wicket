@@ -23,7 +23,7 @@ is usually SQLAlchemy.
   `wicket_tickets` and `wicket_grants`. wicket ships no migrations and creates no tables.
 - **Traits are a JSONB array of name/value records**, preserving their tuple order.
 - **Lanes:** `lane` on `wicket_tickets` and `wicket_grants`, and `wicket_lanes`, one row per pool
-  and lane that is never deleted: `leave` ends its presence. `attend` makes sure the row exists
+  and lane that is never deleted: `leave` ends its presence, if it is still live. `attend` makes sure the row exists
   (an insert of an ended presence, since an insert takes its values before any wait), then renews
   it with an update that reads the clock once the row is locked and only while the presence would
   end within half its ttl. PostgreSQL rechecks that condition after a concurrent writer commits,

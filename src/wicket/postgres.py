@@ -323,10 +323,15 @@ class PostgresLedger(msgspec.Struct, frozen=True):
 
     async def leave(self, pool: str, lane: str) -> None:
         async with self._connection(_COMMITTED) as connection:
-            # ended, not deleted: the row stays for the next attend to renew
+            # ended, not deleted: the row stays for the next attend to renew; a presence already
+            # over is left alone, so workers leaving at once write once
             await connection.execute(
                 update(_lanes)
-                .where(_lanes.c.pool == pool, _lanes.c.lane == lane)
+                .where(
+                    _lanes.c.pool == pool,
+                    _lanes.c.lane == lane,
+                    _lanes.c.present_until > func.clock_timestamp(),
+                )
                 .values(present_until=_ENDED)
             )
             await connection.commit()

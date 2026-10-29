@@ -766,3 +766,22 @@ async def test_an_attend_that_waited_for_another_transaction_leaves_a_live_prese
                 )
             )
     assert live
+
+
+async def test_workers_leaving_at_once_end_the_presence_once(engine: AsyncEngine):
+    ledger = PostgresLedger(engine, HOUR)
+    await ledger.attend("p", "m", ttl=timedelta(seconds=2))
+    async with engine.begin() as connection:
+        for statement in COUNT_LANE_WRITES:
+            await connection.execute(text(statement))
+    try:
+        await asyncio.gather(*(ledger.leave("p", "m") for _ in range(10)))
+        await ledger.leave("p", "never present")
+        async with engine.connect() as connection:
+            writes = await connection.scalar(text("select count(*) from wicket_test_lane_writes"))
+    finally:
+        async with engine.begin() as connection:
+            for statement in UNCOUNT_LANE_WRITES:
+                await connection.execute(text(statement))
+    assert (await ledger.view("p")).present == ()
+    assert writes == 1
