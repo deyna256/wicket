@@ -143,8 +143,9 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         return Released()
 
     async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
-        present, until = self.state._pool(pool).present, self.state.clock() + ttl
-        present[lane] = max(present.get(lane, until), until)
+        present, now = self.state._pool(pool).present, self.state.clock()
+        if present.get(lane, now) <= now + ttl / 2:
+            present[lane] = now + ttl
 
     async def leave(self, pool: str, lane: str) -> None:
         self.state._pool(pool).present.pop(lane, None)

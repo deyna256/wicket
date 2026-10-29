@@ -66,9 +66,12 @@ up to its own ceiling, but in one scheduler that sees every class.
 
 ## Consequences
 
-- At most about one presence write per lane per `poll` while it has a candidate, whatever its grant
-  rate: a presence lasts `2 × poll` and is renewed only when it would end within `poll`. A pool of
-  one lane pays it too; an idle lane writes nothing.
+- About one presence write per lane per `poll` while it has a candidate, whatever its grant rate or
+  number of workers: a presence lasts `2 × poll`, and `attend` renews it only when it would end
+  within `poll`, a condition the store checks atomically. Workers that read the same old presence
+  still each send an `attend` (up to one per worker per `poll`), and in PostgreSQL they queue
+  briefly on the lane's row, but only the first writes. A pool of one lane pays this too; an idle
+  lane writes nothing.
 - A worker whose grant takes longer than `2 × poll` stops being seen until its next pass.
 - Renewals in every lane change one version, so lanes conflict more often.
 - A view reads every lane's tickets: merging pools multiplies the view size

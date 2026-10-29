@@ -23,7 +23,9 @@ is usually SQLAlchemy.
   `wicket_tickets` and `wicket_grants`. wicket ships no migrations and creates no tables.
 - **Traits are a JSONB array of name/value records**, preserving their tuple order.
 - **Lanes:** `lane` on `wicket_tickets` and `wicket_grants`, and `wicket_lanes`, a presence per pool
-  and lane, extended with `GREATEST` so that a short poll never shortens a long one's presence
+  and lane. `attend` is one upsert whose update runs only while the presence would end within half
+  its ttl; PostgreSQL rechecks that condition after a concurrent `attend` commits, so workers
+  attending at once write the row once, and a longer presence is never shortened
   ([decision 8](0008-lanes.md)).
 - **The store's clock only**: a view reads `now()`, every other call `clock_timestamp()`, and times
   are read back as UTC.

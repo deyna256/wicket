@@ -658,3 +658,35 @@ async def test_lanes_in_several_os_processes_never_exceed_the_pool_or_lane_limit
     assert len(started) == len(set(started)) == len(grants) == 5
     assert sum(id.startswith("m") for id in started) <= 3
     assert sum(id.startswith("g") for id in started) <= 3
+
+
+COUNT_LANE_WRITES = (
+    "create table wicket_test_lane_writes (lane text not null)",
+    "create function wicket_test_note_lane_write() returns trigger language plpgsql as"
+    " $$ begin insert into wicket_test_lane_writes values (new.lane); return new; end $$",
+    "create trigger wicket_test_lane_writes after insert or update on wicket_lanes"
+    " for each row execute function wicket_test_note_lane_write()",
+)
+UNCOUNT_LANE_WRITES = (
+    "drop trigger wicket_test_lane_writes on wicket_lanes",
+    "drop function wicket_test_note_lane_write()",
+    "drop table wicket_test_lane_writes",
+)
+
+
+async def test_workers_attending_at_once_write_the_presence_once(engine: AsyncEngine):
+    async with engine.begin() as connection:
+        for statement in COUNT_LANE_WRITES:
+            await connection.execute(text(statement))
+    try:
+        ledger, ttl = PostgresLedger(engine, HOUR), timedelta(seconds=2)
+        await asyncio.gather(*(ledger.attend("p", "m", ttl=ttl) for _ in range(10)))
+        await elapse(engine, timedelta(seconds=1.5))  # within half the ttl of its end
+        await asyncio.gather(*(ledger.attend("p", "m", ttl=ttl) for _ in range(10)))
+        async with engine.connect() as connection:
+            writes = await connection.scalar(text("select count(*) from wicket_test_lane_writes"))
+    finally:
+        async with engine.begin() as connection:
+            for statement in UNCOUNT_LANE_WRITES:
+                await connection.execute(text(statement))
+    assert writes == 2  # one insert, one renewal; the other 18 calls wrote nothing

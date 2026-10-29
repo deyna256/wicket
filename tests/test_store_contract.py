@@ -472,6 +472,18 @@ async def test_a_presence_lasts_its_time_is_never_shortened_and_keeps_the_versio
     assert (await store.ledger.view("p")).present == ()
 
 
+async def test_a_presence_is_renewed_only_once_it_would_end_within_half_its_ttl(store: Pair):
+    ten = timedelta(seconds=10)
+    await store.ledger.attend("p", "mentor", ttl=ten)
+    await store.elapse(timedelta(seconds=3))
+    await store.ledger.attend("p", "mentor", ttl=ten)  # still 7 s to go: nothing written
+    assert (await store.ledger.view("p")).present == (Presence("mentor", EPOCH + ten),)
+    await store.elapse(timedelta(seconds=3))
+    await store.ledger.attend("p", "mentor", ttl=ten)  # 4 s to go: renewed
+    six = timedelta(seconds=6)
+    assert (await store.ledger.view("p")).present == (Presence("mentor", EPOCH + six + ten),)
+
+
 async def test_leave_removes_a_presence_of_its_own_pool_only(store: Pair):
     ten = timedelta(seconds=10)
     for pool in "pq":

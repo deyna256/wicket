@@ -50,8 +50,9 @@ class Ledger(Protocol):
     async def release(self, permit: Permit) -> Released | LeaseLost: ...
 
     async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
-        """Keep the lane present until at least now + ttl by the store's clock; never shorten a
-        presence. Never changes the version."""
+        """Make the lane present until now + ttl by the store's clock, unless its presence lasts
+        beyond now + ttl / 2: then change nothing, so that workers attending at once write once.
+        Never shortens a presence; never changes the version."""
         ...
 
     async def leave(self, pool: str, lane: str) -> None:

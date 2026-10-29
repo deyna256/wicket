@@ -305,10 +305,10 @@ class PostgresLedger(msgspec.Struct, frozen=True):
         first = upsert(_lanes).values(pool=pool, lane=lane, present_until=until)
         longer = first.on_conflict_do_update(
             index_elements=[_lanes.c.pool, _lanes.c.lane],
-            # a process with a short poll never shortens the presence of one with a long poll
-            set_={
-                "present_until": func.greatest(_lanes.c.present_until, first.excluded.present_until)
-            },
+            set_={"present_until": first.excluded.present_until},
+            # rechecked after a concurrent attend commits, so workers attending at once write once;
+            # a presence ending later, as a longer poll's, is left as it is
+            where=_lanes.c.present_until <= func.clock_timestamp() + self._seconds(ttl / 2),
         )
         async with self._connection(_COMMITTED) as connection:
             await connection.execute(longer)
