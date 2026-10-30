@@ -19,6 +19,7 @@ from wicket.memory import MemoryBacklog, MemoryLedger, MemoryState
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -29,7 +30,7 @@ from wicket.results import (
 )
 from wicket.store import Backlog, Ledger
 from wicket.tickets import Permit, Ticket, Trait
-from wicket.view import Grant, Presence
+from wicket.view import Grant
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 LEASE = timedelta(seconds=30)
@@ -463,33 +464,151 @@ async def test_a_ticket_keeps_its_lane_and_its_grant_records_it(store: Pair):
 
 async def test_a_presence_lasts_its_time_is_never_shortened_and_keeps_the_version(store: Pair):
     ten = timedelta(seconds=10)
-    await store.ledger.attend("p", "mentor", ttl=ten)
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
     view = await store.ledger.view("p")
-    assert (view.present, view.version) == ((Presence("mentor", EPOCH + ten),), 0)
-    await store.ledger.attend("p", "mentor", ttl=timedelta(seconds=2))
-    assert (await store.ledger.view("p")).present == (Presence("mentor", EPOCH + ten),)
+    assert len(view.present) == 1
+    first = view.present[0]
+    assert (first.lane, first.until, view.version) == ("mentor", EPOCH + ten, 0)
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=2))
+    renewed = (await store.ledger.view("p")).present[0]
+    assert (renewed.lane, renewed.until) == ("mentor", EPOCH + ten)
+    assert renewed.token != first.token
     await store.elapse(ten)
     assert (await store.ledger.view("p")).present == ()
 
 
-async def test_a_presence_is_renewed_only_once_it_would_end_within_half_its_ttl(store: Pair):
+async def test_an_attend_from_before_a_grant_cannot_refresh_a_presence(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    stale = await store.ledger.view("p")
+    await store.ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=10))
+    presence = (await store.ledger.view("p")).present[0]
+    await granted(store, "1")
+    assert (
+        await store.ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=20))
+        == Conflict()
+    )
+    view = await store.ledger.view("p")
+    assert view.present == (presence,)
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=20))
+        == Attended()
+    )
+    assert (await store.ledger.view("p")).present[0].token != presence.token
+
+
+async def test_an_attend_is_not_invalidated_by_a_grant_in_another_lane(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="generation"))
+    view = await store.ledger.view("p")
+    await granted(store, "1")
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=10))
+        == Attended()
+    )
+    assert (await store.ledger.view("p")).present[0].lane == "mentor"
+
+
+async def test_an_attend_from_before_a_renewal_cannot_refresh_a_presence(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    permit = await granted(store, "1")
+    stale = await store.ledger.view("p")
+    assert await store.ledger.renew(permit, lease=LEASE) == Renewed()
+    assert (
+        await store.ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=10))
+        == Conflict()
+    )
+    assert (await store.ledger.view("p")).present == ()
+
+
+async def test_an_attend_rejects_a_version_the_pool_has_not_reached(store: Pair):
+    assert (
+        await store.ledger.attend("p", "mentor", version=1, ttl=timedelta(seconds=10)) == Conflict()
+    )
+    assert (await store.ledger.view("p")).present == ()
+
+
+async def test_a_grant_or_renewal_cannot_change_a_different_lanes_marker(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    view = await store.ledger.view("p")
+    waiting = view.waiting[0]
+    wrong_ticket = msgspec.structs.replace(waiting.ticket, lane="generation")
+    wrong_waiting = msgspec.structs.replace(waiting, ticket=wrong_ticket)
+    permit = await store.ledger.grant(
+        "p", wrong_waiting, version=view.version, lease=LEASE, fairness=view.fairness
+    )
+    assert isinstance(permit, Permit)
+    assert permit.waiting.ticket.lane == "mentor"
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=10))
+        == Conflict()
+    )
+    assert (
+        await store.ledger.attend(
+            "p", "generation", version=view.version, ttl=timedelta(seconds=10)
+        )
+        == Attended()
+    )
+    view = await store.ledger.view("p")  # before the renewal
+    wrong_permit = msgspec.structs.replace(permit, waiting=wrong_waiting)
+    assert await store.ledger.renew(wrong_permit, lease=LEASE) == Renewed()
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=10))
+        == Conflict()
+    )
+    assert (
+        await store.ledger.attend(
+            "p", "generation", version=view.version, ttl=timedelta(seconds=10)
+        )
+        == Attended()
+    )
+
+
+@pytest.mark.parametrize("lane", ["", "a,b", 'a"b', "дорога"])
+async def test_a_lanes_name_is_a_single_marker_key(store: Pair, lane: str):
+    await store.backlog.submit("p", Ticket("1", "ann", lane=lane))
+    stale = await store.ledger.view("p")
+    await granted(store, "1")
+    assert await store.ledger.attend("p", lane, version=stale.version, ttl=LEASE) == Conflict()
+    assert await store.ledger.attend("p", "another", version=stale.version, ttl=LEASE) == Attended()
+
+
+async def test_a_presence_is_extended_from_each_attend(store: Pair):
     ten = timedelta(seconds=10)
-    await store.ledger.attend("p", "mentor", ttl=ten)
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
     await store.elapse(timedelta(seconds=3))
-    await store.ledger.attend("p", "mentor", ttl=ten)  # still 7 s to go: nothing written
-    assert (await store.ledger.view("p")).present == (Presence("mentor", EPOCH + ten),)
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
+    assert (await store.ledger.view("p")).present[0].until == EPOCH + timedelta(seconds=3) + ten
     await store.elapse(timedelta(seconds=3))
-    await store.ledger.attend("p", "mentor", ttl=ten)  # 4 s to go: renewed
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
     six = timedelta(seconds=6)
-    assert (await store.ledger.view("p")).present == (Presence("mentor", EPOCH + six + ten),)
+    assert (await store.ledger.view("p")).present[0].until == EPOCH + six + ten
+
+
+async def test_a_stale_leave_cannot_remove_a_renewed_or_recreated_presence(store: Pair):
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=10))
+    stale = (await store.ledger.view("p")).present[0]
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=1))
+    current = (await store.ledger.view("p")).present[0]
+    assert current.until == stale.until and current.token != stale.token
+    await store.ledger.leave("p", stale)
+    assert (await store.ledger.view("p")).present == (current,)
+    await store.ledger.leave("p", current)
+    assert (await store.ledger.view("p")).present == ()
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=10))
+    recreated = (await store.ledger.view("p")).present[0]
+    assert recreated.token != stale.token
+    await store.ledger.leave("p", stale)
+    assert (await store.ledger.view("p")).present == (recreated,)
 
 
 async def test_leave_removes_a_presence_of_its_own_pool_only(store: Pair):
     ten = timedelta(seconds=10)
     for pool in "pq":
-        await store.ledger.attend(pool, "mentor", ttl=ten)
-    await store.ledger.attend("p", "generation", ttl=ten)
-    await store.ledger.leave("p", "mentor")
-    await store.ledger.leave("p", "never present")
-    assert (await store.ledger.view("p")).present == (Presence("generation", EPOCH + ten),)
-    assert (await store.ledger.view("q")).present == (Presence("mentor", EPOCH + ten),)
+        await store.ledger.attend(pool, "mentor", version=0, ttl=ten)
+    await store.ledger.attend("p", "generation", version=0, ttl=ten)
+    generation, mentor = (await store.ledger.view("p")).present
+    other = (await store.ledger.view("q")).present[0]
+    await store.ledger.leave("p", other)  # another pool's token cannot remove p's mentor
+    await store.ledger.leave("p", mentor)
+    await store.ledger.leave("p", mentor)  # leaving twice changes nothing
+    assert (await store.ledger.view("p")).present == (generation,)
+    assert (await store.ledger.view("q")).present == (other,)

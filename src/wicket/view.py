@@ -1,6 +1,7 @@
 """The snapshot of a pool that every decision reads."""
 
 from datetime import datetime, timedelta
+from uuid import UUID
 
 import msgspec
 
@@ -16,10 +17,11 @@ class Grant(msgspec.Struct, frozen=True):
 
 
 class Presence(msgspec.Struct, frozen=True):
-    """A lane with a worker waiting for a ticket it could take, until this moment."""
+    """A lane present until this moment, with the identity of its last attendance."""
 
     lane: str
     until: datetime
+    token: UUID
 
 
 class PoolView(msgspec.Struct, frozen=True, kw_only=True):

@@ -27,7 +27,7 @@ All code is in `src/wicket/`.
 
 | module | what is there |
 |---|---|
-| `results.py` | the result values `Withdrawn`, `AlreadyLeased`, `Gone`, `Conflict`, `Missing`, `Renewed`, `Released`, `LeaseLost`, `NoTicket`; the errors `LeaseLostError` and `StoreUnavailable` |
+| `results.py` | the result values `Withdrawn`, `AlreadyLeased`, `Gone`, `Attended`, `Conflict`, `Missing`, `Renewed`, `Released`, `LeaseLost`, `NoTicket`; the errors `LeaseLostError` and `StoreUnavailable` |
 | `tickets.py` | `Version`, `Trait`, which checks its value, `Ticket`, `Waiting`, `Permit` |
 | `fairness.py` | `Fairness`, Start-time Fair Queuing with every ticket weighing one |
 | `view.py` | `PoolView`, the snapshot every decision reads, and its `Grant` and `Presence` records |
@@ -104,6 +104,11 @@ version ([decision 8](docs/decisions/0008-lanes.md)).
 Each `Waiting` carries a store-generated UUIDv4 `submission_id`. A grant matches it with the pool
 and ticket id, returning `Missing` if the ticket was removed and replaced. The identity and its
 lifecycle are defined in [decision 2](docs/decisions/0002-pure-decision-over-a-store.md).
+
+Each `Presence` carries the UUID of its last attendance. A leave matches it before removing the
+presence, so a stale view cannot erase a later attendance. An attendance checks that no grant or
+renewal in its lane has changed the pool since its view, so a stale view cannot make a capped lane
+present ([decision 8](docs/decisions/0008-lanes.md)).
 
 **Failure.** Delivery is at least once. Only a block that ends normally releases its ticket; an
 error of the body, a cancellation or a lost lease (`LeaseLostError`) releases nothing, so the ticket

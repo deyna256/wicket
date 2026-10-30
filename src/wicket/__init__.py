@@ -7,6 +7,7 @@ from wicket.pool import Pool
 from wicket.priority import Age, Factor, FairShare, Priority, TraitFactor
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -25,6 +26,7 @@ from wicket.view import Grant, PoolView, Presence
 __all__ = [
     "Age",
     "AlreadyLeased",
+    "Attended",
     "Backlog",
     "Concurrency",
     "Conflict",

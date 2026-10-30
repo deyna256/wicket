@@ -26,7 +26,15 @@ from wicket.limits import Concurrency, Lane, Rate
 from wicket.pool import Pool
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.priority import FairShare, Priority
-from wicket.results import Conflict, LeaseLost, Missing, Renewed, StoreUnavailable, Withdrawn
+from wicket.results import (
+    Attended,
+    Conflict,
+    LeaseLost,
+    Missing,
+    Renewed,
+    StoreUnavailable,
+    Withdrawn,
+)
 from wicket.tickets import Permit, Ticket, Waiting
 
 pytestmark = pytest.mark.postgres
@@ -412,6 +420,38 @@ async def test_a_renewal_checks_expiry_after_waiting_for_the_pool(engine: AsyncE
     assert await ledger.view("p") == expired
 
 
+async def test_a_renewal_checks_expiry_after_waiting_for_the_ticket(engine: AsyncEngine, url: URL):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    permit = await grant_first(ledger)
+    assert isinstance(permit, Permit)
+    await elapse(engine, timedelta(seconds=29))
+    async with asyncio.TaskGroup() as tasks, engine.begin() as connection:
+        await connection.execute(text("select id from wicket_tickets where id = '1' for update"))
+        renewal = tasks.create_task(ledger.renew(permit, lease=LEASE))
+        await until(
+            url,
+            f"exists (select {OTHERS} and wait_event_type = 'Lock'"
+            " and query like '%wicket_tickets%')",
+        )
+        await elapse(engine, timedelta(seconds=2))
+        expired = await ledger.view("p")
+    assert renewal.result() == LeaseLost()
+    assert await ledger.view("p") == expired
+
+
+async def test_a_lost_permit_does_not_wait_for_the_ticket_of_its_new_holder(engine: AsyncEngine):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    permit = await grant_first(ledger)
+    assert isinstance(permit, Permit)
+    await elapse(engine, LEASE)
+    assert isinstance(await grant_first(ledger), Permit)
+    async with engine.begin() as connection:
+        await connection.execute(text("select id from wicket_tickets where id = '1' for update"))
+        assert await asyncio.wait_for(ledger.renew(permit, lease=LEASE), 5) == LeaseLost()
+
+
 async def test_grants_come_back_in_order_after_old_ones_are_deleted(url: URL):
     no_index = settings(url, enable_indexscan="off", enable_bitmapscan="off")
     async with emptied(url, EPOCH, connect_args=no_index) as engine:
@@ -674,71 +714,119 @@ UNCOUNT_LANE_WRITES = (
 )
 
 
-async def test_workers_attending_at_once_write_the_presence_once(engine: AsyncEngine):
-    async with engine.begin() as connection:
-        for statement in COUNT_LANE_WRITES:
-            await connection.execute(text(statement))
-    try:
-        ledger, ttl = PostgresLedger(engine, HOUR), timedelta(seconds=2)
-        await asyncio.gather(*(ledger.attend("p", "m", ttl=ttl) for _ in range(10)))
-        await elapse(engine, timedelta(seconds=1.5))  # within half the ttl of its end
-        await asyncio.gather(*(ledger.attend("p", "m", ttl=ttl) for _ in range(10)))
-        async with engine.connect() as connection:
-            writes = await connection.scalar(text("select count(*) from wicket_test_lane_writes"))
-    finally:
-        async with engine.begin() as connection:
-            for statement in UNCOUNT_LANE_WRITES:
-                await connection.execute(text(statement))
-    assert writes == 2  # the row inserted, then renewed once; the other 18 wrote nothing
-
-
-async def test_an_attend_that_waited_for_another_transaction_leaves_a_live_presence(
-    engine: AsyncEngine, url: URL
+@pytest.mark.parametrize("outcome", ["commit", "rollback"])
+async def test_attend_waiting_for_a_first_insert_uses_the_clock_after_the_wait(
+    engine: AsyncEngine, url: URL, outcome: str
 ):
-    # PostgreSQL's own clock_timestamp(), which moves while the attend waits, not the test clock
-    real_clock = settings(url, search_path="pg_catalog,public")
+    ttl = timedelta(seconds=2)
+    ledger = PostgresLedger(engine, HOUR)
+    async with engine.connect() as holding:
+        transaction = await holding.begin()
+        old_token = await holding.scalar(
+            text(
+                "insert into wicket_lanes (pool, lane, present_until) values ('p', 'm', "
+                "clock_timestamp() + interval '10 seconds') returning token"
+            )
+        )
+        attending = asyncio.create_task(ledger.attend("p", "m", version=0, ttl=ttl))
+        try:
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname = current_database()"
+                " and wait_event_type = 'Lock' and query like 'INSERT INTO wicket_lanes%')",
+            )
+            await elapse(engine, timedelta(milliseconds=750))
+            if outcome == "commit":
+                await transaction.commit()
+            else:
+                await transaction.rollback()
+            await asyncio.wait_for(attending, 2)
+        finally:
+            if not attending.done():
+                attending.cancel()
+                await asyncio.gather(attending, return_exceptions=True)
+    view = await ledger.view("p")
+    assert view.present[0].token != old_token
+    if outcome == "commit":
+        assert view.present[0].until == EPOCH + timedelta(seconds=10)
+    else:
+        assert view.present[0].until == view.now + ttl
+
+
+@pytest.mark.parametrize("changed", [True, False])
+async def test_an_attend_waiting_for_a_lane_row_uses_the_clock_after_the_wait(
+    engine: AsyncEngine, url: URL, changed: bool
+):
     ttl = timedelta(seconds=1)
-    async with opened(url, connect_args=real_clock) as realtime:
-        ledger = PostgresLedger(realtime, HOUR)
-        await ledger.attend("p", "m", ttl=ttl)
-        async with realtime.connect() as holding:
-            transaction = await holding.begin()
-            # its presence ended, as leave does, by a transaction still open
+    ledger = PostgresLedger(engine, HOUR)
+    await ledger.attend("p", "m", version=0, ttl=ttl)
+    async with engine.connect() as holding:
+        transaction = await holding.begin()
+        if changed:
             await holding.execute(
                 text("update wicket_lanes set present_until = '-infinity' where lane = 'm'")
             )
-            attending = asyncio.create_task(ledger.attend("p", "m", ttl=ttl))
-            try:
-                await until(
-                    url,
-                    "exists (select 1 from pg_stat_activity where datname = current_database()"
-                    " and wait_event_type = 'Lock' and query like '%wicket_lanes%')",
-                )
-                await asyncio.sleep(1.2)  # longer than the ttl the attend was asked for
-                await transaction.commit()
-                await asyncio.wait_for(attending, 2)
-            finally:
-                attending.cancel()
-                await asyncio.gather(attending, return_exceptions=True)
-        async with realtime.connect() as connection:
-            live = await connection.scalar(
-                text(
-                    "select present_until > pg_catalog.clock_timestamp() from wicket_lanes"
-                    " where lane = 'm'"
-                )
+        else:
+            await holding.execute(text("select 1 from wicket_lanes where lane = 'm' for update"))
+        attending = asyncio.create_task(ledger.attend("p", "m", version=0, ttl=ttl))
+        try:
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname = current_database()"
+                " and wait_event_type = 'Lock' and query like '%wicket_lanes%')",
             )
-    assert live
+            await elapse(engine, timedelta(seconds=2))
+            await transaction.commit()
+            await asyncio.wait_for(attending, 2)
+        finally:
+            attending.cancel()
+            await asyncio.gather(attending, return_exceptions=True)
+    view = await ledger.view("p")
+    assert len(view.present) == 1
+    assert view.present[0].until == view.now + ttl
+
+
+async def test_a_leave_waiting_for_a_concurrent_attend_does_not_remove_it(
+    engine: AsyncEngine, url: URL
+):
+    ledger = PostgresLedger(engine, HOUR)
+    await ledger.attend("p", "m", version=0, ttl=timedelta(seconds=10))
+    stale = (await ledger.view("p")).present[0]
+    async with engine.connect() as holding:
+        transaction = await holding.begin()
+        # Simulate an uncommitted attend that has replaced the token.
+        token = await holding.scalar(
+            text(
+                "update wicket_lanes set token = gen_random_uuid()"
+                " where pool = 'p' and lane = 'm' returning token"
+            )
+        )
+        leaving = asyncio.create_task(ledger.leave("p", stale))
+        try:
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname = current_database()"
+                " and wait_event_type = 'Lock' and query like 'UPDATE wicket_lanes%')",
+            )
+            await transaction.commit()
+            await asyncio.wait_for(leaving, 2)
+        finally:
+            leaving.cancel()
+            await asyncio.gather(leaving, return_exceptions=True)
+    presence = (await ledger.view("p")).present
+    assert len(presence) == 1 and presence[0].token == token != stale.token
 
 
 async def test_workers_leaving_at_once_end_the_presence_once(engine: AsyncEngine):
     ledger = PostgresLedger(engine, HOUR)
-    await ledger.attend("p", "m", ttl=timedelta(seconds=2))
+    await ledger.attend("p", "m", version=0, ttl=timedelta(seconds=2))
+    presence = (await ledger.view("p")).present[0]
     async with engine.begin() as connection:
         for statement in COUNT_LANE_WRITES:
             await connection.execute(text(statement))
     try:
-        await asyncio.gather(*(ledger.leave("p", "m") for _ in range(10)))
-        await ledger.leave("p", "never present")
+        await asyncio.gather(*(ledger.leave("p", presence) for _ in range(10)))
+        await ledger.leave("p", presence)
         async with engine.connect() as connection:
             writes = await connection.scalar(text("select count(*) from wicket_test_lane_writes"))
     finally:
@@ -747,3 +835,384 @@ async def test_workers_leaving_at_once_end_the_presence_once(engine: AsyncEngine
                 await connection.execute(text(statement))
     assert (await ledger.view("p")).present == ()
     assert writes == 1
+
+
+async def test_a_delayed_attend_cannot_refresh_after_its_lanes_grant(engine: AsyncEngine, url: URL):
+    ledger, ttl = PostgresLedger(engine, HOUR), timedelta(seconds=2)
+    async with AsyncSession(engine) as session:
+        await PostgresBacklog(session).submit("p", Ticket("m1", "ann", lane="mentor"))
+        await session.commit()
+    await ledger.attend("p", "mentor", version=0, ttl=ttl)
+    stale = await ledger.view("p")
+    presence = stale.present[0]
+    async with engine.connect() as holding:
+        transaction = await holding.begin()
+        await holding.execute(text("select 1 from wicket_lanes where lane='mentor' for update"))
+        attending = asyncio.create_task(ledger.attend("p", "mentor", version=0, ttl=ttl))
+        try:
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname=current_database()"
+                " and wait_event_type='Lock' and query like '%wicket_lanes%FOR UPDATE%')",
+            )
+            # Grant must not wait for the lane row; the later attendance must reject the old view.
+            granted = await asyncio.wait_for(
+                ledger.grant(
+                    "p",
+                    stale.waiting[0],
+                    version=stale.version,
+                    lease=LEASE,
+                    fairness=stale.fairness,
+                ),
+                3,
+            )
+            assert isinstance(granted, Permit)
+            await transaction.commit()
+            assert await asyncio.wait_for(attending, 3) == Conflict()
+        finally:
+            if not attending.done():
+                attending.cancel()
+                await asyncio.gather(attending, return_exceptions=True)
+    assert (await ledger.view("p")).present == (presence,)
+
+
+async def test_a_view_that_missed_a_pending_renewal_cannot_mark_its_lane_ready(
+    engine: AsyncEngine, url: URL
+):
+    ledger, lease = PostgresLedger(engine, HOUR), timedelta(seconds=10)
+    async with AsyncSession(engine) as session:
+        await PostgresBacklog(session).submit("p", Ticket("m1", "ann", lane="mentor"))
+        await session.commit()
+    permit = await grant_first(ledger, lease=lease)
+    assert isinstance(permit, Permit)
+    await elapse(engine, timedelta(seconds=9))
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "create function test_hold_renewal() returns trigger language plpgsql as $$"
+                " begin perform pg_advisory_xact_lock(789132,41); return new; end $$"
+            )
+        )
+        await connection.execute(
+            text(
+                "create trigger test_hold_renewal after update on wicket_tickets"
+                " for each row execute function test_hold_renewal()"
+            )
+        )
+    renewing = attending = None
+    try:
+        async with engine.connect() as holding:
+            await holding.execute(text("select pg_advisory_lock(789132,41)"))
+            try:
+                renewing = asyncio.create_task(ledger.renew(permit, lease=lease))
+                await until(
+                    url,
+                    "exists (select 1 from pg_stat_activity where datname=current_database()"
+                    " and wait_event_type='Lock' and query like 'UPDATE wicket_tickets%')",
+                )
+                await elapse(engine, timedelta(seconds=2))
+                stale = await ledger.view("p")
+                assert stale.leased == ()  # the old lease expired; its renewal is not committed
+                attending = asyncio.create_task(
+                    ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=2))
+                )
+                await until(
+                    url,
+                    "exists (select 1 from pg_stat_activity where datname=current_database()"
+                    " and wait_event_type='Lock' and query like 'SELECT wicket_pools.version%')",
+                )
+            finally:
+                await holding.execute(text("select pg_advisory_unlock(789132,41)"))
+            assert await asyncio.wait_for(renewing, 3) == Renewed()
+            assert await asyncio.wait_for(attending, 3) == Conflict()
+    finally:
+        for task in (renewing, attending):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (renewing, attending) if task is not None), return_exceptions=True
+        )
+        async with engine.begin() as connection:
+            await connection.execute(text("drop trigger test_hold_renewal on wicket_tickets"))
+            await connection.execute(text("drop function test_hold_renewal()"))
+    assert (await ledger.view("p")).present == ()
+
+
+async def test_cancelling_an_attend_waiting_for_the_pool_releases_its_lane(
+    engine: AsyncEngine, url: URL
+):
+    ledger, ttl = PostgresLedger(engine, HOUR), timedelta(seconds=10)
+    await ledger.attend("p", "new", version=0, ttl=ttl)
+    await ledger.leave("p", (await ledger.view("p")).present[0])
+    await ledger.attend("p", "warm", version=0, ttl=ttl)
+    before = await ledger.view("p")
+    async with engine.begin() as holding:
+        await holding.execute(text("select name from wicket_pools where name='p' for update"))
+        attending = asyncio.create_task(ledger.attend("p", "new", version=0, ttl=ttl))
+        try:
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname=current_database()"
+                " and wait_event_type='Lock' and query like 'SELECT wicket_pools.version%')",
+            )
+            attending.cancel()
+            assert isinstance(
+                (await asyncio.gather(attending, return_exceptions=True))[0], asyncio.CancelledError
+            )
+            async with engine.connect() as probe:
+                result = await probe.execute(
+                    text(
+                        "select lane from wicket_lanes where pool='p' and lane='new'"
+                        " for update nowait"
+                    )
+                )
+                assert result.scalar_one() == "new"
+        finally:
+            if not attending.done():
+                attending.cancel()
+                await asyncio.gather(attending, return_exceptions=True)
+    assert await ledger.view("p") == before
+    assert await ledger.attend("p", "new", version=0, ttl=ttl) == Attended()
+    assert {presence.lane for presence in (await ledger.view("p")).present} == {"warm", "new"}
+    assert given_back(engine)
+
+
+@pytest.mark.parametrize("outcome", ["cancel", "error"])
+async def test_a_failed_async_commit_hook_gives_back_the_connection(
+    engine: AsyncEngine, url: URL, outcome: str
+):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    await ledger.attend("p", "warm", version=0, ttl=LEASE)  # a committed pool row to lock
+    before = await ledger.view("p")
+    entering, resume = asyncio.Event(), asyncio.Event()
+
+    def pause_commit(connection: Any) -> None:
+        entering.set()
+        connection.connection.dbapi_connection.run_async(lambda driver: resume.wait())
+        if outcome == "error":
+            raise RuntimeError("commit hook failed")
+
+    async with opened(url) as work_engine:
+        event.listen(work_engine.sync_engine, "commit", pause_commit)
+        work = PostgresLedger(work_engine, HOUR)
+        task = asyncio.create_task(
+            work.grant(
+                "p",
+                before.waiting[0],
+                version=before.version,
+                lease=LEASE,
+                fairness=before.fairness,
+            )
+        )
+        try:
+            await asyncio.wait_for(entering.wait(), 5)
+            if outcome == "cancel":
+                task.cancel()
+            else:
+                resume.set()
+            answer = (await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5))[0]
+            if outcome == "cancel":
+                assert isinstance(answer, asyncio.CancelledError)
+            else:
+                assert isinstance(answer, RuntimeError) and str(answer) == "commit hook failed"
+        finally:
+            resume.set()
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            event.remove(work_engine.sync_engine, "commit", pause_commit)
+        assert given_back(work_engine)
+        async with engine.begin() as probe:
+            row = await probe.scalar(
+                text("select name from wicket_pools where name = 'p' for update nowait")
+            )
+            assert row == "p"
+        assert await ledger.view("p") == before
+        assert await work.view("p") == before
+
+
+@pytest.mark.parametrize("cancel", [False, True], ids=["commit", "cancel"])
+async def test_an_attend_races_with_the_first_grant(engine: AsyncEngine, url: URL, cancel: bool):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    stale = await ledger.view("p")
+    updated, resume = asyncio.Event(), asyncio.Event()
+
+    def pause(connection, cursor, statement, *args):
+        if statement.lstrip().startswith("INSERT INTO wicket_pools"):
+            updated.set()
+            await_(resume.wait())
+
+    async with opened(url) as grant_engine:
+        event.listen(grant_engine.sync_engine, "after_cursor_execute", pause)
+        granting = asyncio.create_task(
+            PostgresLedger(grant_engine, HOUR).grant(
+                "p", stale.waiting[0], version=0, lease=LEASE, fairness=stale.fairness
+            )
+        )
+        attending = None
+        try:
+            await updated.wait()
+            attending = asyncio.create_task(ledger.attend("p", "", version=0, ttl=LEASE))
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname=current_database()"
+                " and wait_event_type='Lock' and query like 'INSERT INTO wicket_pools%')",
+            )
+            if cancel:
+                granting.cancel()
+            resume.set()
+            result = (await asyncio.gather(granting, return_exceptions=True))[0]
+            attended = await asyncio.wait_for(attending, 3)
+        finally:
+            resume.set()
+            for task in (granting, attending):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (granting, attending) if task), return_exceptions=True
+            )
+            event.remove(grant_engine.sync_engine, "after_cursor_execute", pause)
+        assert given_back(grant_engine)
+    view = await ledger.view("p")
+    if cancel:
+        assert isinstance(result, asyncio.CancelledError)
+        assert attended == Attended() and len(view.present) == 1 and view.version == 0
+    else:
+        assert isinstance(result, Permit)
+        assert attended == Conflict() and view.present == () and view.version == 1
+
+
+async def test_a_first_attend_creates_the_pool_before_a_grant(engine: AsyncEngine, url: URL):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    stale = await ledger.view("p")
+    updated, resume = asyncio.Event(), asyncio.Event()
+
+    def pause(connection, cursor, statement, *args):
+        if statement.lstrip().startswith("UPDATE wicket_lanes"):
+            updated.set()
+            await_(resume.wait())
+
+    async with opened(url) as attending_engine:
+        event.listen(attending_engine.sync_engine, "after_cursor_execute", pause)
+        attending = asyncio.create_task(
+            PostgresLedger(attending_engine, HOUR).attend("p", "", version=0, ttl=LEASE)
+        )
+        granting = None
+        try:
+            await updated.wait()
+            granting = asyncio.create_task(
+                ledger.grant("p", stale.waiting[0], version=0, lease=LEASE, fairness=stale.fairness)
+            )
+            await until(
+                url,
+                "exists (select 1 from pg_stat_activity where datname=current_database()"
+                " and wait_event_type='Lock' and query like 'INSERT INTO wicket_pools%')",
+            )
+            resume.set()
+            assert await attending == Attended()
+            assert isinstance(await granting, Permit)
+        finally:
+            resume.set()
+            for task in (attending, granting):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (attending, granting) if task), return_exceptions=True
+            )
+            event.remove(attending_engine.sync_engine, "after_cursor_execute", pause)
+        assert given_back(attending_engine)
+    assert (await ledger.view("p")).version == 1
+
+
+@pytest.mark.parametrize("operation", ["grant", "renew", "attend"])
+async def test_cancelling_a_blocked_commit_releases_locks_and_rolls_back(
+    engine: AsyncEngine, url: URL, operation: str
+):
+    await submit(engine, "1")
+    ledger = PostgresLedger(engine, HOUR)
+    permit = await grant_first(ledger) if operation == "renew" else None
+    if operation == "renew":
+        await elapse(engine, timedelta(seconds=1))
+    else:
+        await ledger.attend("p", "warm", version=0, ttl=LEASE)
+        if operation == "attend":
+            await ledger.attend("p", "new", version=0, ttl=LEASE)
+            presence = next(p for p in (await ledger.view("p")).present if p.lane == "new")
+            await ledger.leave("p", presence)
+    before = await ledger.view("p")
+    async with engine.begin() as connection:
+        await connection.execute(
+            text(
+                "create function test_wait_commit() returns trigger language plpgsql as $$"
+                " begin perform pg_advisory_xact_lock(984312, 6); return new; end $$"
+            )
+        )
+        for table in ("wicket_pools", "wicket_lanes"):
+            await connection.execute(
+                text(
+                    f"create constraint trigger test_wait_commit after insert or update on {table}"
+                    " deferrable initially deferred for each row"
+                    " execute function test_wait_commit()"
+                )
+            )
+    try:
+        async with engine.connect() as holding:
+            await holding.execute(text("select pg_advisory_lock(984312, 6)"))
+            try:
+                async with opened(url) as work_engine:
+                    work = PostgresLedger(work_engine, HOUR)
+                    if operation == "renew":
+                        assert isinstance(permit, Permit)
+                        call = work.renew(permit, lease=LEASE)
+                    elif operation == "grant":
+                        call = work.grant(
+                            "p",
+                            before.waiting[0],
+                            version=before.version,
+                            lease=LEASE,
+                            fairness=before.fairness,
+                        )
+                    else:
+                        call = work.attend("p", "new", version=before.version, ttl=LEASE)
+                    task = asyncio.create_task(call)
+                    try:
+                        await until(
+                            url,
+                            f"exists (select {OTHERS} and wait_event_type = 'Lock'"
+                            " and query like 'COMMIT%')",
+                        )
+                        task.cancel()
+                        answer = (
+                            await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+                        )[0]
+                        assert isinstance(answer, asyncio.CancelledError)
+                    finally:
+                        if not task.done():
+                            task.cancel()
+                            await asyncio.gather(task, return_exceptions=True)
+                    assert given_back(work_engine)
+                    async with engine.begin() as probe:
+                        statement = "select name from wicket_pools where name='p' for update nowait"
+                        assert await probe.scalar(text(statement)) == "p"
+                        if operation == "attend":
+                            statement = (
+                                "select lane from wicket_lanes where pool = 'p' and lane = 'new'"
+                                " for update nowait"
+                            )
+                            assert await probe.scalar(text(statement)) == "new"
+            finally:
+                await holding.execute(text("select pg_advisory_unlock(984312, 6)"))
+    finally:
+        async with engine.begin() as connection:
+            await connection.execute(text("set local lock_timeout = '5s'"))
+            for table in ("wicket_pools", "wicket_lanes"):
+                await connection.execute(text(f"drop trigger test_wait_commit on {table}"))
+            await connection.execute(text("drop function test_wait_commit()"))
+    assert await ledger.view("p") == before
+    assert await ledger.attend("p", "", version=before.version, ttl=LEASE) == Attended()
+    if operation == "renew":
+        await elapse(engine, timedelta(seconds=29.5))
+        assert (await ledger.view("p")).leased == ()

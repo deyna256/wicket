@@ -21,7 +21,7 @@ create table wicket_test_clock (at timestamptz not null);
 insert into wicket_test_clock values ('-infinity');
 create function public.now() returns timestamptz language sql stable
     as 'select at from public.wicket_test_clock';
-create function public.clock_timestamp() returns timestamptz language sql stable
+create function public.clock_timestamp() returns timestamptz language sql volatile
     as 'select at from public.wicket_test_clock';
 """
 

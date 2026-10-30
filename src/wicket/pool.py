@@ -9,6 +9,7 @@ from datetime import timedelta
 from wicket.limits import Lane, Limit
 from wicket.priority import Priority
 from wicket.results import (
+    Attended,
     Conflict,
     LeaseLost,
     LeaseLostError,
@@ -95,7 +96,17 @@ class Pool:
         while True:
             view = await self._ledger.view(self._name)
             # be seen before granting: a lane may appear, or choose, while this grant is on its way
-            await self._attend(view)
+            own = view.in_lanes(self._lane.name)
+            if own.waiting and self._lane.admits(view):
+                match await self._ledger.attend(
+                    self._name, self._lane.name, version=view.version, ttl=2 * self._poll
+                ):
+                    case Conflict():
+                        continue
+                    case Attended():
+                        pass
+            elif own.present:
+                await self._ledger.leave(self._name, own.present[0])
             match await self._attempt(view):
                 case (Permit() as permit, float() as since):
                     return permit, since
@@ -104,17 +115,6 @@ class Pool:
                 case NoTicket():
                     seconds = self._poll.total_seconds()
                     await asyncio.sleep(random.uniform(seconds / 2, seconds))
-
-    async def _attend(self, view: PoolView) -> None:
-        """Keep this lane present while it has a ticket its own limits let it take; leave once it
-        has none. A presence never changes the version."""
-        own = view.in_lanes(self._lane.name)
-        candidate = bool(own.waiting) and self._lane.admits(view)
-        if candidate:
-            if all(presence.until <= view.now + self._poll for presence in own.present):
-                await self._ledger.attend(self._name, self._lane.name, ttl=2 * self._poll)
-        elif own.present:
-            await self._ledger.leave(self._name, self._lane.name)
 
     async def _attempt(self, view: PoolView) -> tuple[Permit, float] | Conflict | NoTicket:
         if not (self._lane.admits(view) and all(limit.admits(view) for limit in self._limits)):

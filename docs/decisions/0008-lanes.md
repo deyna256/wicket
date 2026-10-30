@@ -21,8 +21,14 @@ up to its own ceiling, but in one scheduler that sees every class.
   only its leased tickets and grants; the pool's `limits` count every lane. `Pool` serves `Lane("")`
   unless given another.
 - **Fairness is judged across every lane that can take work.** Before every attempt to grant, a
-  worker makes its lane present in the store (`Ledger.attend`, for `2 × poll`) while the lane has a
-  waiting ticket that its own limits let it take, and leaves once it has none. So a lane is seen
+  worker refreshes its lane's presence in the store (`Ledger.attend`, for `2 × poll`) while the
+  lane has a waiting ticket that its own limits let it take, and leaves once it has none. Attendance
+  carries the view's version and returns `Conflict` if a grant or renewal in that lane has changed
+  the pool since the view; the worker reads again. A grant in another lane does not conflict; a
+  version newer than the pool does. Each attendance gets a new token; a leave removes only the token
+  in the worker's view. A stale leave
+  therefore cannot hide a worker that has since attended. The worker checks the store rather than
+  trusting the snapshot's time, which can be stale by the time it returns. So a lane is seen
   while it waits at the pool's limit and while its grant is on its way, by lanes already there and
   by lanes that appear meanwhile. It chooses among its own lane's tickets and every present lane's,
   and grants only if the winner is its own; otherwise it yields, and the winner's lane takes it.
@@ -65,20 +71,26 @@ up to its own ceiling, but in one scheduler that sees every class.
 
 ## Consequences
 
-- About one presence write per lane per `poll` while it has a candidate, whatever its grant rate or
-  number of workers: a presence lasts `2 × poll`, and `attend` renews it only when it would end
-  within `poll`, a condition the store checks atomically. Workers that read the same old presence
-  each send an `attend`, but only the first writes; `leave` writes only a live presence. Workers of
-  one lane with different polls renew it on their own schedules, so keep a lane's polls alike. A
-  pool of one lane pays this too; an idle lane writes nothing.
-- A worker whose grant takes longer than `2 × poll` stops being seen until its next pass.
+- Every pass with a candidate calls `attend`: PostgreSQL normally locks the row and then updates it,
+  also reading the pool row under a shared lock, so every worker writes on every pass. Writes grow
+  with the number of workers and their grant rate.
+  An absent row needs an insert and, if that races, another lock. `leave` writes only a live presence
+  whose token matches. A pool of one lane pays this too; an idle lane writes nothing.
+- A presence lasts at least `2 × poll` from the store's clock at its refresh unless a matching leave
+  ends it. Time spent returning from the store or granting uses part of that time; once it expires,
+  the worker is unseen until its next pass.
 - Renewals in every lane change one version, so lanes conflict more often.
+- The pool keeps one last-change marker per lane ever granted or renewed. Its size grows with the
+  number of distinct lane names.
+- A delayed attendance holding the shared pool lock delays grants and renewals in every lane until
+  it finishes; an unresponsive database or worker may therefore cause a lease to expire. Attendance
+  waiting for its lane row does not yet hold the pool lock.
 - A view reads every lane's tickets: merging pools multiplies the view size
   ([decision 2](0002-pure-decision-over-a-store.md)).
 - A lost choice waits up to the winning lane's `poll`, even when the pool has room for both: give a
   pool's lanes similar polls.
-- A lane whose last free worker just started its work stays present up to `2 × poll`, and others may
-  yield to it meanwhile; a stale `leave` hides a lane for up to one `poll`.
+- A lane whose last free worker just started its work stays present until the recorded end, and
+  others may yield to it meanwhile. A longer poll from another worker can make that end later.
 - **An exception to "a busy lane does not hold back another":** a ticket held by another transaction
   (for example an uncommitted `withdraw`) stays the winner in the other lanes' views. If its lane has
   nothing else to grant, the other lanes yield to it until that transaction ends. If it commits a

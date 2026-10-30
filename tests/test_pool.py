@@ -14,6 +14,7 @@ from wicket.memory import MemoryBacklog, MemoryLedger, MemoryState
 from wicket.pool import Pool
 from wicket.priority import FairShare, Priority, TraitFactor
 from wicket.results import (
+    Attended,
     Conflict,
     LeaseLost,
     LeaseLostError,
@@ -23,7 +24,7 @@ from wicket.results import (
     StoreUnavailable,
 )
 from wicket.tickets import Permit, Ticket, Trait, Version, Waiting
-from wicket.view import PoolView
+from wicket.view import PoolView, Presence
 
 pytestmark = pytest.mark.looptime
 
@@ -85,13 +86,15 @@ class Scripted:
     async def release(self, permit: Permit) -> Released | LeaseLost:
         return await self.ledger.release(permit)
 
-    async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
+    async def attend(
+        self, pool: str, lane: str, *, version: Version, ttl: timedelta
+    ) -> Attended | Conflict:
         self.attendance.append(lane)
-        await self.ledger.attend(pool, lane, ttl=ttl)
+        return await self.ledger.attend(pool, lane, version=version, ttl=ttl)
 
-    async def leave(self, pool: str, lane: str) -> None:
-        self.attendance.append(f"-{lane}")
-        await self.ledger.leave(pool, lane)
+    async def leave(self, pool: str, presence: Presence) -> None:
+        self.attendance.append(f"-{presence.lane}")
+        await self.ledger.leave(pool, presence)
 
 
 def pool(
@@ -650,6 +653,52 @@ async def test_a_lane_at_its_own_cap_does_not_hold_back_another():
     await asyncio.gather(holder, waiter, return_exceptions=True)
 
 
+async def test_a_delayed_attend_of_a_capped_lane_does_not_hold_back_another():
+    backlog, ledger = store()
+    await backlog.submit("p", Ticket("m1", "alice", lane="m"))
+    await backlog.submit("p", Ticket("m2", "bob", lane="m"))
+    await asyncio.sleep(1)
+    await backlog.submit("p", Ticket("g1", "carol", lane="g"))
+
+    class PausedAttend(Scripted):
+        def __init__(self, ledger: MemoryLedger) -> None:
+            super().__init__(ledger)
+            self.waiting, self.go, self.finished, self.reply = (asyncio.Event() for _ in range(4))
+
+        async def attend(
+            self, pool: str, lane: str, *, version: Version, ttl: timedelta
+        ) -> Attended | Conflict:
+            self.waiting.set()
+            await self.go.wait()
+            answer = await super().attend(pool, lane, version=version, ttl=ttl)
+            self.finished.set()
+            await self.reply.wait()
+            return answer
+
+    capped, slow, order = Lane("m", Concurrency(1)), PausedAttend(ledger), []
+    late = asyncio.create_task(work(pool(slow, lane=capped), [], 0))
+    holder = cleaner = None
+    try:
+        await slow.waiting.wait()  # m has capacity in the old view
+        holder = asyncio.create_task(work(pool(ledger, lane=capped), order, 60))
+        await asyncio.sleep(0)
+        assert order == ["m1"]
+        cleaner = asyncio.create_task(work(pool(ledger, lane=capped), [], 0))
+        await asyncio.sleep(0)  # this worker removes the now-capped lane's presence
+        assert (await ledger.view("p")).present == ()
+        slow.go.set()
+        await slow.finished.wait()  # do not let the old worker take another view yet
+        await asyncio.wait_for(work(pool(ledger, lane=Lane("g")), order, 0), 0.25)
+        assert order == ["m1", "g1"]
+    finally:
+        for task in (late, holder, cleaner):
+            if task is not None:
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (late, holder, cleaner) if task), return_exceptions=True
+        )
+
+
 async def test_the_presence_of_a_worker_gone_away_expires_and_the_others_go_on():
     backlog, ledger = store()
     await backlog.submit("p", Ticket("g0", "bob", lane="g"))
@@ -669,21 +718,14 @@ async def test_the_presence_of_a_worker_gone_away_expires_and_the_others_go_on()
     assert order == ["g0", "g1"] and now() < 6
 
 
-async def test_a_lane_granting_at_once_writes_once_a_poll_and_one_with_nothing_waiting_never():
+async def test_a_lane_with_nothing_waiting_never_attends():
     backlog, ledger = store()
-    for n in range(3):
-        await backlog.submit("p", Ticket(f"a{n}", "a"))
-    plain = Scripted(ledger)
-    for _ in range(3):
-        async with pool(plain).permit():
-            pass
     await backlog.submit("p", Ticket("g1", "bob", lane="g"))
     idle = Scripted(ledger)
     with pytest.raises(TimeoutError):
         async with asyncio.timeout(3), pool(idle, lane=Lane("m")).permit():
             pass
-    # three grants in one moment: the presence written before the first lasts past the others
-    assert (plain.attendance, idle.attendance) == ([""], [])
+    assert idle.attendance == []
 
 
 class SlowGrant(Scripted):
@@ -691,13 +733,137 @@ class SlowGrant(Scripted):
 
     def __init__(self, ledger: MemoryLedger) -> None:
         super().__init__(ledger)
+        self.granting = asyncio.Event()
         self.through = asyncio.Event()
 
     async def grant(
         self, pool: str, waiting: Waiting, *, version: Version, lease: timedelta, fairness: Fairness
     ) -> Permit | Conflict | Missing:
+        self.granting.set()
         await self.through.wait()
         return await super().grant(pool, waiting, version=version, lease=lease, fairness=fairness)
+
+
+class SlowView(SlowGrant):
+    """A snapshot held until the test lets the worker read it."""
+
+    def __init__(self, ledger: MemoryLedger) -> None:
+        super().__init__(ledger)
+        self.viewed = asyncio.Event()
+        self.continue_view = asyncio.Event()
+
+    async def view(self, pool: str) -> PoolView:
+        view = await super().view(pool)
+        self.viewed.set()
+        await self.continue_view.wait()
+        return view
+
+
+class SlowLeave(Scripted):
+    """A leave held until another worker has attended."""
+
+    def __init__(self, ledger: MemoryLedger) -> None:
+        super().__init__(ledger)
+        self.leaving = asyncio.Event()
+        self.through = asyncio.Event()
+        self.left = asyncio.Event()
+
+    async def leave(self, pool: str, presence: Presence) -> None:
+        self.leaving.set()
+        await self.through.wait()
+        await super().leave(pool, presence)
+        self.left.set()
+
+
+async def test_a_stale_leave_cannot_hide_a_worker_whose_grant_is_on_its_way():
+    backlog, ledger = store()
+    await ledger.attend("p", "g", version=0, ttl=2 * POLL)
+    slow_leave = SlowLeave(ledger)
+    old = asyncio.create_task(work(pool(slow_leave, lane=Lane("g")), [], 0))
+    bob = alice = None
+    try:
+        await slow_leave.leaving.wait()  # this worker saw a lane with no waiting tickets
+        await backlog.submit("p", Ticket("bob", "bob", lane="g"))
+        await asyncio.sleep(0.1)
+        await backlog.submit("p", Ticket("alice", "alice", lane="m"))
+        slow_grant, order = SlowGrant(ledger), []
+        bob = asyncio.create_task(work(pool(slow_grant, lane=Lane("g")), order, 0))
+        await slow_grant.granting.wait()  # bob refreshed the presence
+        slow_leave.through.set()
+        await slow_leave.left.wait()
+        old.cancel()  # the old worker stops; it cannot renew the presence on its next poll
+        await asyncio.gather(old, return_exceptions=True)
+        await asyncio.sleep(1.3)
+        alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
+        await asyncio.sleep(0.2)
+        assert order == []
+        slow_grant.through.set()
+        await asyncio.gather(bob, alice)
+        assert order == ["bob", "alice"]
+    finally:
+        for task in (old, bob, alice):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (old, bob, alice) if task is not None), return_exceptions=True
+        )
+
+
+async def test_a_worker_renews_a_presence_that_expired_during_its_view():
+    backlog, ledger = store()
+    await backlog.submit("p", Ticket("bob", "bob", lane="g"))
+    await asyncio.sleep(1)
+    await backlog.submit("p", Ticket("alice", "alice", lane="m"))
+    await ledger.attend("p", "g", version=0, ttl=2 * POLL)
+    await asyncio.sleep(0.75)
+    slow, order = SlowView(ledger), []
+    bob = asyncio.create_task(work(pool(slow, lane=Lane("g")), order, 0))
+    alice = None
+    try:
+        await slow.viewed.wait()
+        await asyncio.sleep(1.3)  # the snapshot still shows a presence, but it has expired
+        slow.continue_view.set()
+        await asyncio.sleep(0)
+        alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
+        await asyncio.sleep(0.2)
+        assert order == []
+        slow.through.set()
+        await asyncio.gather(bob, alice)
+        assert order == ["bob", "alice"]
+    finally:
+        for task in (bob, alice):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (bob, alice) if task is not None), return_exceptions=True
+        )
+
+
+async def test_a_worker_stays_present_during_a_grant_shorter_than_two_polls():
+    backlog, ledger = store()
+    await backlog.submit("p", Ticket("bob", "bob", lane="g"))
+    await asyncio.sleep(1)
+    await backlog.submit("p", Ticket("alice", "alice", lane="m"))
+    await ledger.attend("p", "g", version=0, ttl=2 * POLL)
+    await asyncio.sleep(0.75)  # the old presence has more than one poll left
+    slow, order = SlowGrant(ledger), []
+    bob = asyncio.create_task(work(pool(slow, lane=Lane("g")), order, 0))
+    alice = None
+    try:
+        await asyncio.sleep(1.3)  # less than two polls since bob began its grant
+        alice = asyncio.create_task(work(pool(ledger, lane=Lane("m")), order, 0))
+        await asyncio.sleep(0.2)
+        assert order == []
+        slow.through.set()
+        await asyncio.gather(bob, alice)
+        assert order == ["bob", "alice"]
+    finally:
+        for task in (bob, alice):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (bob, alice) if task is not None), return_exceptions=True
+        )
 
 
 async def test_a_lane_is_seen_by_a_lane_that_appears_while_its_grant_is_on_its_way():
@@ -779,13 +945,13 @@ async def test_after_a_missing_ticket_the_lane_chooses_again_among_its_own():
     for id, tenant, lane in [("held", "alice", "m"), ("c1", "carol", "m"), ("g1", "bob", "g")]:
         await backlog.submit("p", Ticket(id, tenant, lane=lane))
         await asyncio.sleep(1)
-    await ledger.attend("p", "g", ttl=timedelta(hours=1))
+    await ledger.attend("p", "g", version=1, ttl=timedelta(hours=1))
     held = Scripted(ledger, grants=[Missing()])  # alice's ticket, the winner, is held elsewhere
     async with pool(held, lane=Lane("m")).permit() as permit:
         assert permit.waiting.ticket.id == "c1"  # not a yield to bob, who waits on alice too
 
 
-async def test_a_presence_removed_by_a_stale_leave_is_back_within_one_poll():
+async def test_a_removed_presence_is_back_within_one_poll():
     backlog, ledger = store()
     await backlog.submit("p", Ticket("g0", "bob", lane="g"))
     await backlog.submit("p", Ticket("g1", "bob", lane="g"))
@@ -796,7 +962,8 @@ async def test_a_presence_removed_by_a_stale_leave_is_back_within_one_poll():
     await asyncio.sleep(0)
     waiting = asyncio.create_task(work(pool(ledger, full, Lane("m")), order, 0))
     await asyncio.sleep(0.5)
-    await ledger.leave("p", "m")
+    presence = next(p for p in (await ledger.view("p")).present if p.lane == "m")
+    await ledger.leave("p", presence)
     await asyncio.sleep(POLL.total_seconds())
     assert "m" in [presence.lane for presence in (await ledger.view("p")).present]
     for task in (busy, waiting):
@@ -852,7 +1019,9 @@ async def test_a_redelivery_counts_in_the_pool_and_lane_limits():
 class CannotAttend(Scripted):
     """A ledger whose presences cannot reach the store."""
 
-    async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
+    async def attend(
+        self, pool: str, lane: str, *, version: Version, ttl: timedelta
+    ) -> Attended | Conflict:
         raise StoreUnavailable("down")
 
 
@@ -875,7 +1044,7 @@ async def test_lanes_ranking_each_other_first_never_grant_so_they_share_one_prio
     await backlog.submit("p", Ticket("a1", "alice", (Trait("tier", 1.0),), lane="m"))
     await backlog.submit("p", Ticket("b1", "bob", lane="g"))
     for lane in "mg":  # both lanes already present, as when their workers have waited a while
-        await ledger.attend("p", lane, ttl=timedelta(hours=1))
+        await ledger.attend("p", lane, version=1, ttl=timedelta(hours=1))
     by_tier = Priority((TraitFactor("tier"), 1))
     order: list[str] = []
     with pytest.raises(TimeoutError):

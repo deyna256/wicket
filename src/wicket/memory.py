@@ -10,6 +10,7 @@ import msgspec
 from wicket.fairness import Fairness
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -36,7 +37,8 @@ class _Pool:
         self.tickets: dict[str, Waiting] = {}  # every ticket, leased or not, with its grants so far
         self.leases: dict[str, _Lease] = {}
         self.grants: list[Grant] = []
-        self.present: dict[str, datetime] = {}  # lane: until
+        self.present: dict[str, Presence] = {}
+        self.lane_changes: dict[str, Version] = {}
 
     def leased(self, ticket_id: str, now: datetime) -> bool:
         return ticket_id in self.leases and self.leases[ticket_id].end > now
@@ -100,7 +102,7 @@ class MemoryLedger(msgspec.Struct, frozen=True):
             leased=tuple(lease.permit for lease in held.leases.values() if lease.end > now),
             grants=tuple(held.grants),
             present=tuple(
-                Presence(lane, end) for lane, end in sorted(held.present.items()) if end > now
+                presence for _, presence in sorted(held.present.items()) if presence.until > now
             ),
             fairness=held.fairness,
             version=held.version,
@@ -119,6 +121,7 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         if current.submission_id != waiting.submission_id:
             return Missing()
         held.version += 1
+        held.lane_changes[current.ticket.lane] = held.version
         permit = Permit(pool, current, now, held.version)
         held.tickets[ticket_id] = msgspec.structs.replace(current, grants=current.grants + 1)
         held.leases[ticket_id] = _Lease(permit, now + lease)
@@ -132,6 +135,7 @@ class MemoryLedger(msgspec.Struct, frozen=True):
             return LeaseLost()
         held.leases[id] = _Lease(held.leases[id].permit, now + lease)
         held.version += 1
+        held.lane_changes[held.leases[id].permit.waiting.ticket.lane] = held.version
         return Renewed()
 
     async def release(self, permit: Permit) -> Released | LeaseLost:
@@ -142,10 +146,18 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         del held.leases[id]
         return Released()
 
-    async def attend(self, pool: str, lane: str, *, ttl: timedelta) -> None:
-        present, now = self.state._pool(pool).present, self.state.clock()
-        if present.get(lane, now) <= now + ttl / 2:
-            present[lane] = now + ttl
+    async def attend(
+        self, pool: str, lane: str, *, version: Version, ttl: timedelta
+    ) -> Attended | Conflict:
+        held = self.state._pool(pool)
+        if version > held.version or held.lane_changes.get(lane, 0) > version:
+            return Conflict()
+        present, now = held.present, self.state.clock()
+        until = max(present[lane].until, now + ttl) if lane in present else now + ttl
+        present[lane] = Presence(lane, until, uuid4())
+        return Attended()
 
-    async def leave(self, pool: str, lane: str) -> None:
-        self.state._pool(pool).present.pop(lane, None)
+    async def leave(self, pool: str, presence: Presence) -> None:
+        present, lane = self.state._pool(pool).present, presence.lane
+        if lane in present and present[lane].token == presence.token:
+            del present[lane]

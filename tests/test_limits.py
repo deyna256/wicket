@@ -78,12 +78,13 @@ def test_a_view_narrowed_to_lanes_keeps_only_their_tickets_grants_and_presences(
         waiting=(m, g),
         leased=(Permit("p", m, EPOCH, 1), Permit("p", g, EPOCH, 2)),
         grants=(Grant(EPOCH, "m"), Grant(EPOCH, "g")),
-        present=(Presence("g", EPOCH), Presence("m", EPOCH)),
+        present=(Presence("g", EPOCH, UUID(int=1)), Presence("m", EPOCH, UUID(int=2))),
         version=7,
     )
     narrowed = view.in_lanes("m")
     assert narrowed.waiting == (m,) and [p.token for p in narrowed.leased] == [1]
-    assert narrowed.grants == (Grant(EPOCH, "m"),) and narrowed.present == (Presence("m", EPOCH),)
+    assert narrowed.grants == (Grant(EPOCH, "m"),)
+    assert narrowed.present == (Presence("m", EPOCH, UUID(int=2)),)
     assert narrowed.version == 7 and view.in_lanes("m", "g") == view
 
 
