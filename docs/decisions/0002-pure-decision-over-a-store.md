@@ -82,3 +82,4 @@ store (one SQL query), and a leader process.
   be valid. Each PostgreSQL renewal writes the pool row as well as its ticket; no new table is needed.
 - An idle pool reads its snapshot every `poll` per process. A store-side wake-up can come later behind
   the same `permit()`.
+- Lanes add presences that steer the choice without changing the version ([decision 8](0008-lanes.md)).

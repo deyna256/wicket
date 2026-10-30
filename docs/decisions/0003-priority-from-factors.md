@@ -15,10 +15,12 @@ ticket is, and how importance becomes a choice.
   `Age(full_after)`, and `TraitFactor(name)` for one of the ticket's `traits`.
 - **`Priority` is weighted factors,** as in [Slurm's multifactor
   priority](https://slurm.schedmd.com/priority_multifactor.html), and `first(view)` returns the
-  ticket with the highest weighted sum; ties go to the earlier `submitted_at`, then the smaller id.
-  An empty `Priority` is FIFO. Weights are non-negative and their sum must fit in a finite float;
-  `Priority` rejects an unsupported configuration with `ValueError` at construction, so valid factor
-  scores cannot overflow the weighted sum.
+  ticket with the highest weighted sum; ties go to the tenant with the smallest fairness tag, served
+  longest ago ([decision 4](0004-start-time-fair-queuing.md)), then the earlier `submitted_at`, then
+  the smaller id. An empty `Priority` takes tenants in turn, each first in, first out. Weights are
+  non-negative and their sum must fit in a finite float; `Priority` rejects an unsupported
+  configuration with `ValueError` at construction, so valid factor scores cannot overflow the
+  weighted sum.
 - **No ordering seam.** Fairness and favouring a user are both factors, so a second discipline would
   solve the same problems less predictably.
 - **What a weight means:** a factor decides alone when its weight times the smallest step between its
@@ -30,8 +32,8 @@ ticket is, and how importance becomes a choice.
   a trait, not the trait itself. The caller turns its own data into traits where it submits, as
   Temporal takes a priority key and Slurm a QOS priority rather than the job's data. The worker reads
   the work from the caller's row, so nothing else needs to travel.
-- **Pools do not nest.** Capacity is split between pools, as Kubernetes API Priority and Fairness
-  gives each priority level its own seats.
+- **Pools do not nest;** kinds of work sharing one capacity are lanes of a pool
+  ([decision 8](0008-lanes.md)), which also requires one `Priority` for all of them.
 
 ## Alternatives
 

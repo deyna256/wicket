@@ -16,7 +16,11 @@ class Gone(msgspec.Struct, frozen=True):
 
 
 class Conflict(msgspec.Struct, frozen=True):
-    """A grant or renewal changed the pool: the view's version is stale."""
+    """A grant or renewal invalidated the view, or its version is not a pool version."""
+
+
+class Attended(msgspec.Struct, frozen=True):
+    """The lane's presence is recorded."""
 
 
 class Missing(msgspec.Struct, frozen=True):

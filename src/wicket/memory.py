@@ -10,6 +10,7 @@ import msgspec
 from wicket.fairness import Fairness
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -19,7 +20,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.tickets import Permit, Ticket, Version, Waiting
-from wicket.view import PoolView
+from wicket.view import Grant, PoolView, Presence
 
 
 class _Lease(msgspec.Struct, frozen=True):
@@ -28,14 +29,16 @@ class _Lease(msgspec.Struct, frozen=True):
 
 
 class _Pool:
-    """One pool's tickets, leases, grant history, fairness and version."""
+    """One pool's tickets, leases, grant history, lane presences, fairness and version."""
 
     def __init__(self) -> None:
         self.version: Version = 0
         self.fairness = Fairness()
         self.tickets: dict[str, Waiting] = {}  # every ticket, leased or not, with its grants so far
         self.leases: dict[str, _Lease] = {}
-        self.grant_times: list[datetime] = []
+        self.grants: list[Grant] = []
+        self.present: dict[str, Presence] = {}
+        self.lane_changes: dict[str, Version] = {}
 
     def leased(self, ticket_id: str, now: datetime) -> bool:
         return ticket_id in self.leases and self.leases[ticket_id].end > now
@@ -91,13 +94,16 @@ class MemoryLedger(msgspec.Struct, frozen=True):
 
     async def view(self, pool: str) -> PoolView:
         held, now = self.state._pool(pool), self.state.clock()
-        held.grant_times = [at for at in held.grant_times if at > now - self.state.retention]
+        held.grants = [g for g in held.grants if g.at > now - self.state.retention]
         return PoolView(
             now=now,
             retention=self.state.retention,
             waiting=tuple(w for id, w in held.tickets.items() if not held.leased(id, now)),
             leased=tuple(lease.permit for lease in held.leases.values() if lease.end > now),
-            grant_times=tuple(held.grant_times),
+            grants=tuple(held.grants),
+            present=tuple(
+                presence for _, presence in sorted(held.present.items()) if presence.until > now
+            ),
             fairness=held.fairness,
             version=held.version,
         )
@@ -115,10 +121,11 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         if current.submission_id != waiting.submission_id:
             return Missing()
         held.version += 1
+        held.lane_changes[current.ticket.lane] = held.version
         permit = Permit(pool, current, now, held.version)
         held.tickets[ticket_id] = msgspec.structs.replace(current, grants=current.grants + 1)
         held.leases[ticket_id] = _Lease(permit, now + lease)
-        held.grant_times.append(now)
+        held.grants.append(Grant(now, current.ticket.lane))
         held.fairness = fairness
         return permit
 
@@ -128,6 +135,7 @@ class MemoryLedger(msgspec.Struct, frozen=True):
             return LeaseLost()
         held.leases[id] = _Lease(held.leases[id].permit, now + lease)
         held.version += 1
+        held.lane_changes[held.leases[id].permit.waiting.ticket.lane] = held.version
         return Renewed()
 
     async def release(self, permit: Permit) -> Released | LeaseLost:
@@ -137,3 +145,19 @@ class MemoryLedger(msgspec.Struct, frozen=True):
         del held.tickets[id]
         del held.leases[id]
         return Released()
+
+    async def attend(
+        self, pool: str, lane: str, *, version: Version, ttl: timedelta
+    ) -> Attended | Conflict:
+        held = self.state._pool(pool)
+        if version > held.version or held.lane_changes.get(lane, 0) > version:
+            return Conflict()
+        present, now = held.present, self.state.clock()
+        until = max(present[lane].until, now + ttl) if lane in present else now + ttl
+        present[lane] = Presence(lane, until, uuid4())
+        return Attended()
+
+    async def leave(self, pool: str, presence: Presence) -> None:
+        present, lane = self.state._pool(pool).present, presence.lane
+        if lane in present and present[lane].token == presence.token:
+            del present[lane]

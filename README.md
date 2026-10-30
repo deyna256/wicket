@@ -136,6 +136,31 @@ ticket = Ticket("task-1", "alice", traits=(Trait("tier", 1.0), Trait("urgent", 0
 tickets by that named value, or `0` when absent. A ticket takes a tuple of traits with unique names;
 neither the tuple nor its traits can change. Tickets encode and decode with msgspec without hooks.
 
+## Lanes
+
+Kinds of work that share one capacity are lanes of one pool: each lane has limits of its own, the
+pool's limits count them all, and a freed slot goes to the tenant whose turn it is in any lane
+with a waiting worker.
+
+```python
+from wicket import Lane
+
+await backlog.submit("ai", Ticket(id="r1", tenant="alice", lane="mentor"))
+
+mentor = Pool(
+    ledger,
+    "ai",
+    lane=Lane("mentor", Rate(8, per=timedelta(minutes=1))),
+    limits=(Rate(10, per=timedelta(minutes=1)),),
+    priority=Priority((FairShare(), 1)),
+    lease=timedelta(minutes=2),
+    poll=timedelta(seconds=1),
+)
+```
+
+Every process serving a pool must configure the same pool limits and priority; the rules and costs
+are in [decision 8](https://github.com/deyna256/wicket/blob/main/docs/decisions/0008-lanes.md).
+
 ## PostgreSQL
 
 The extra brings SQLAlchemy; bring your driver, asyncpg or psycopg.
@@ -156,14 +181,6 @@ async with session.begin():  # your transaction: the row and its ticket commit t
 
 ledger = PostgresLedger(engine, retention=timedelta(hours=1))  # the same retention in every process
 ```
-
-## Upgrading from 0.1.0 to 0.2.0
-
-This release changes [ticket traits](https://github.com/deyna256/wicket/blob/main/docs/decisions/0003-priority-from-factors.md)
-and the [Ledger contract](https://github.com/deyna256/wicket/blob/main/docs/decisions/0002-pure-decision-over-a-store.md).
-Upgrade all producers, workers and custom adapters sharing a pool together. Existing databases need the
-[submission ID migration](https://github.com/deyna256/wicket/blob/main/docs/decisions/0007-postgres-store.md#adding-submission-ids-to-an-existing-table)
-before using the updated adapters; follow its stop, migrate and upgrade instructions before resuming work.
 
 ## Status
 

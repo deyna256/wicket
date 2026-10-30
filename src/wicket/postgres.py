@@ -19,15 +19,17 @@ try:
         Row,
         Table,
         Text,
+        cast,
         delete,
         exc,
         func,
         insert,
+        literal_column,
         or_,
         select,
         update,
     )
-    from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID
+    from sqlalchemy.dialects.postgresql import JSONB, TIMESTAMP, UUID, array
     from sqlalchemy.dialects.postgresql import insert as upsert
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 except ModuleNotFoundError as error:
@@ -38,6 +40,7 @@ except ModuleNotFoundError as error:
 from wicket.fairness import Fairness
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -48,7 +51,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.tickets import Permit, Ticket, Version, Waiting
-from wicket.view import PoolView
+from wicket.view import Grant, PoolView, Presence
 
 __all__ = ["PostgresBacklog", "PostgresLedger", "metadata"]
 
@@ -60,6 +63,7 @@ _pools = Table(
     Column("name", Text, primary_key=True),
     Column("version", BigInteger, nullable=False),
     Column("fairness", JSONB, nullable=False),
+    Column("lane_changes", JSONB, nullable=False, server_default=literal_column("'{}'::jsonb")),
 )
 _tickets = Table(
     "wicket_tickets",
@@ -68,6 +72,7 @@ _tickets = Table(
     Column("id", Text, primary_key=True),
     Column("submission_id", UUID, nullable=False, server_default=func.gen_random_uuid()),
     Column("tenant", Text, nullable=False),
+    Column("lane", Text, nullable=False),
     Column("traits", JSONB, nullable=False),
     Column("submitted_at", TIMESTAMP(timezone=True), nullable=False),
     Column("grants", Integer, nullable=False),
@@ -80,11 +85,21 @@ _grants = Table(
     metadata,
     Column("pool", Text, nullable=False),
     Column("at", TIMESTAMP(timezone=True), nullable=False),
+    Column("lane", Text, nullable=False),
     Index("wicket_grants_pool_at", "pool", "at"),
+)
+_lanes = Table(
+    "wicket_lanes",
+    metadata,
+    Column("pool", Text, primary_key=True),
+    Column("lane", Text, primary_key=True),
+    Column("present_until", TIMESTAMP(timezone=True), nullable=False),
+    Column("token", UUID, nullable=False, server_default=func.gen_random_uuid()),
 )
 
 _COMMITTED = {"isolation_level": "READ COMMITTED"}
 _SNAPSHOT = {"isolation_level": "REPEATABLE READ", "postgresql_readonly": True}
+_ENDED = literal_column("'-infinity'::timestamptz")  # a lane's row while it is absent
 
 
 class _Reach(msgspec.Struct, frozen=True):
@@ -123,6 +138,7 @@ class PostgresBacklog(msgspec.Struct, frozen=True):
                     pool=pool,
                     id=ticket.id,
                     tenant=ticket.tenant,
+                    lane=ticket.lane,
                     traits=msgspec.to_builtins(ticket.traits),
                     submitted_at=func.clock_timestamp(),
                     grants=0,
@@ -173,21 +189,32 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             tickets = select(_tickets, (_tickets.c.lease_end > now).label("leased")).where(
                 _tickets.c.pool == pool
             )
+            attending = (
+                select(_lanes.c.lane, _lanes.c.present_until, _lanes.c.token)
+                .where(_lanes.c.pool == pool, _lanes.c.present_until > now)
+                .order_by(_lanes.c.lane)
+            )
             history = (
-                select(_grants.c.at)
+                select(_grants.c.at, _grants.c.lane)
                 .where(_grants.c.pool == pool, _grants.c.at > now - self.retention)
                 .order_by(_grants.c.at)
             )
             known = (await connection.execute(head)).first()
             rows = (await connection.execute(tickets)).all()
-            times = await connection.scalars(history)
-            moments = tuple(at.astimezone(UTC) for at in times)
+            present = tuple(
+                Presence(row.lane, row.present_until.astimezone(UTC), row.token)
+                for row in await connection.execute(attending)
+            )
+            grants = tuple(
+                Grant(row.at.astimezone(UTC), row.lane) for row in await connection.execute(history)
+            )
         return PoolView(
             now=now,
             retention=self.retention,
             waiting=tuple(self._waiting(row) for row in rows if not row.leased),
             leased=tuple(self._permit(pool, row) for row in rows if row.leased),
-            grant_times=moments,
+            grants=grants,
+            present=present,
             fairness=msgspec.convert(known.fairness, Fairness) if known else Fairness(),
             version=known.version if known else 0,
         )
@@ -235,37 +262,62 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             if row is None:
                 await connection.rollback()
                 return Missing()
+            await self._changed_lane(connection, pool, row.lane, bumped.version)
             forget = delete(_grants).where(
                 _grants.c.pool == pool, _grants.c.at <= now - self.retention
             )
-            await connection.execute(insert(_grants).values(pool=pool, at=now))
+            await connection.execute(insert(_grants).values(pool=pool, at=now, lane=row.lane))
             await connection.execute(forget)
             await connection.commit()
         return self._permit(pool, row)
 
     async def renew(self, permit: Permit, *, lease: timedelta) -> Renewed | LeaseLost:
+        valid = (
+            _tickets.c.pool == permit.pool,
+            _tickets.c.id == permit.waiting.ticket.id,
+            _tickets.c.token == permit.token,
+            _tickets.c.lease_end > func.clock_timestamp(),
+        )
         async with self._connection(_COMMITTED) as connection:
-            # Lock the pool before checking expiry, so a delayed renewal invalidates stale grants.
-            await connection.execute(
+            # Lock in the grant's order; recheck expiry after either lock's wait.
+            version = await connection.scalar(
                 update(_pools)
                 .where(_pools.c.name == permit.pool)
                 .values(version=_pools.c.version + 1)
+                .returning(_pools.c.version)
             )
-            renewed = await connection.execute(
-                update(_tickets)
-                .where(
-                    _tickets.c.pool == permit.pool,
-                    _tickets.c.id == permit.waiting.ticket.id,
-                    _tickets.c.token == permit.token,
-                    _tickets.c.lease_end > func.clock_timestamp(),
-                )
-                .values(lease_end=func.clock_timestamp() + self._seconds(lease))
-            )
-            if renewed.rowcount != 1:
+            locked = await connection.execute(select(_tickets.c.id).where(*valid).with_for_update())
+            if locked.first() is None:
                 await connection.rollback()
                 return LeaseLost()
+            renewed = await connection.execute(
+                update(_tickets)
+                .where(*valid)
+                .values(lease_end=func.clock_timestamp() + self._seconds(lease))
+                .returning(_tickets.c.lane)
+            )
+            lane = renewed.scalar_one_or_none()
+            if lane is None or version is None:
+                await connection.rollback()
+                return LeaseLost()
+            await self._changed_lane(connection, permit.pool, lane, version)
             await connection.commit()
         return Renewed()
+
+    async def _changed_lane(
+        self, connection: AsyncConnection, pool: str, lane: str, version: Version
+    ) -> None:
+        await connection.execute(
+            update(_pools)
+            .where(_pools.c.name == pool)
+            .values(
+                lane_changes=func.jsonb_set(
+                    _pools.c.lane_changes,
+                    array([lane], type_=Text),
+                    func.to_jsonb(cast(version, BigInteger)),
+                )
+            )
+        )
 
     async def release(self, permit: Permit) -> Released | LeaseLost:
         async with self._connection(_COMMITTED) as connection:
@@ -279,12 +331,86 @@ class PostgresLedger(msgspec.Struct, frozen=True):
             await connection.commit()
         return Released() if released.rowcount == 1 else LeaseLost()
 
+    async def attend(
+        self, pool: str, lane: str, *, version: Version, ttl: timedelta
+    ) -> Attended | Conflict:
+        until = func.clock_timestamp() + self._seconds(ttl)
+        row = upsert(_lanes).values(pool=pool, lane=lane, present_until=_ENDED)
+        locked = (
+            select(_lanes.c.lane)
+            .where(_lanes.c.pool == pool, _lanes.c.lane == lane)
+            .with_for_update()
+        )
+        renew = (
+            update(_lanes)
+            .where(
+                _lanes.c.pool == pool,
+                _lanes.c.lane == lane,
+            )
+            .values(
+                present_until=func.greatest(_lanes.c.present_until, until),
+                token=func.gen_random_uuid(),
+            )
+        )
+        async with self._connection(_COMMITTED) as connection:
+            if (await connection.execute(locked)).first() is None:
+                inserted = await connection.execute(
+                    row.on_conflict_do_nothing().returning(_lanes.c.lane)
+                )
+                if inserted.first() is None:
+                    await connection.execute(locked)
+            # Wait for the lane before locking the pool, so queued attendances do not block grants.
+            head = (
+                select(_pools.c.version, _pools.c.lane_changes)
+                .where(_pools.c.name == pool)
+                .with_for_update(read=True)
+            )
+            known = (await connection.execute(head)).first()
+            if known is None and version == 0:
+                await connection.execute(
+                    upsert(_pools)
+                    .values(name=pool, version=0, fairness=msgspec.to_builtins(Fairness()))
+                    .on_conflict_do_nothing()
+                )
+                known = (await connection.execute(head)).first()
+            if (
+                known is None
+                or version > known.version
+                or known.lane_changes.get(lane, 0) > version
+            ):
+                await connection.rollback()
+                return Conflict()
+            await connection.execute(renew)
+            await connection.commit()
+        return Attended()
+
+    async def leave(self, pool: str, presence: Presence) -> None:
+        async with self._connection(_COMMITTED) as connection:
+            await connection.execute(
+                update(_lanes)
+                .where(
+                    _lanes.c.pool == pool,
+                    _lanes.c.lane == presence.lane,
+                    _lanes.c.token == presence.token,
+                    _lanes.c.present_until > func.clock_timestamp(),
+                )
+                .values(present_until=_ENDED)
+            )
+            await connection.commit()
+
     @contextlib.asynccontextmanager
     async def _connection(self, options: dict[str, Any]) -> AsyncGenerator[AsyncConnection, None]:
         """A connection at the isolation this call needs, whatever the engine's own."""
         async with _Reach().executing(), contextlib.AsyncExitStack() as stack:
             connection = await _Reach().connect(stack.enter_async_context(self.engine.connect()))
-            yield await connection.execution_options(**options)
+            try:
+                yield await connection.execution_options(**options)
+            except BaseException:
+                # A failed commit hook can leave the driver in a transaction marked inactive.
+                transaction = connection.get_transaction()
+                if transaction is not None and not transaction.is_active and not connection.closed:
+                    await connection.rollback()
+                raise
 
     def _seconds(self, time: timedelta) -> ColumnElement[Any]:
         """A duration in seconds: `interval '1 day'` across a daylight-saving change lasts 23 h."""
@@ -297,8 +423,7 @@ class PostgresLedger(msgspec.Struct, frozen=True):
 
     def _waiting(self, row: Row[*tuple[Any, ...]]) -> Waiting:
         """A ticket read back through Ticket's own checks, at UTC whatever the session's zone."""
-        traits = row.traits
-        if isinstance(traits, dict):  # tickets written before traits became immutable values
-            traits = [{"name": name, "value": value} for name, value in traits.items()]
-        ticket = msgspec.convert({"id": row.id, "tenant": row.tenant, "traits": traits}, Ticket)
+        ticket = msgspec.convert(
+            {"id": row.id, "tenant": row.tenant, "traits": row.traits, "lane": row.lane}, Ticket
+        )
         return Waiting(ticket, row.submitted_at.astimezone(UTC), row.submission_id, row.grants)

@@ -18,11 +18,16 @@ a fair queuing scheme of its own, also starts a newly active queue at the curren
 
 - `Fairness` holds a virtual time `v` and a finish tag per tenant; a tenant starts at
   `max(v, finish[t])`, or at `v` with no tag.
-- `Fairness.after(waiting)` for a first grant sets `v` to the tenant's start, its finish to `v + 1`,
-  and drops tags no greater than the new `v`. For a redelivery it returns the same `Fairness`, so a
-  crashed worker costs its tenant no turn.
+- `Fairness.after(waiting, tenants)` for a first grant sets `v` to the tenant's start and its finish
+  to `v + 1`. Every tenant in `tenants`, those with a waiting ticket, keeps its tag, or gets the `v`
+  it arrived at; other tags are dropped once no greater than `v`. For a redelivery it returns the
+  same `Fairness`, so a crashed worker costs its tenant no turn.
 - `FairShare()` scores `1` for the waiting tickets of the tenants with the smallest start and `0` for
-  the rest.
+  the rest. Starts clamp a lagging tag to `v`, so a tenant passed over by a heavier factor cannot
+  take `FairShare`'s point from the tenants of a higher tier.
+- `Priority` breaks ties by the raw tag, served longest ago first. Among tenants passed over by a
+  heavier factor, or waiting in a lane served less often ([decision 8](0008-lanes.md)), the turn
+  order is kept: dropping their tags would leave every tie to the earlier submission.
 - `Fairness` is written by the grant, so the version check covers it.
 
 With every ticket weighing one this is round robin over the tenants with waiting tickets, in which a
@@ -43,7 +48,7 @@ Each was tried by review or simulation:
 
 - Fairness counts starts, not running time: a tenant whose work takes ten minutes holds more slots
   than one whose work takes one.
-- The state is as large as the recently served tenants: a few dozen in normal load, up to the
-  waiting tenants under overload.
+- The state holds a tag for every tenant with a waiting ticket and every one served recently.
 - The fairness properties hold while `FairShare` decides alone.
-- Weighted shares, `finish = start + 1 / weight`, can come later without changing the contract.
+- Weighted shares, `finish = start + 1 / weight`, can come later without changing the contract;
+  the tie by raw tag is shown for equal weights only.

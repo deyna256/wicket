@@ -19,7 +19,7 @@ class Factor(Protocol):
 
 
 class FairShare(msgspec.Struct, frozen=True):
-    """1 for the tickets of the tenants whose turn it is, 0 for the rest."""
+    """1 for the tickets of the tenants whose turn it is, the smallest start; 0 for the rest."""
 
     def scores(self, view: PoolView) -> Mapping[str, float]:
         starts = view.fairness.starts({w.ticket.tenant for w in view.waiting})
@@ -57,9 +57,10 @@ class TraitFactor(msgspec.Struct, frozen=True):
 
 class Priority:
     """Weighted factors, and the choice of the ticket with the highest weighted sum; ties go to the
-    earlier submitted, then the smaller id. Weights are non-negative and their sum must fit in a
-    finite float. No factors is first in, first out. A plain class, since a Struct cannot take its
-    factors as arguments; it never changes after construction."""
+    tenant served longest ago, then the earlier submitted, then the smaller id. Weights are
+    non-negative and their sum must fit in a finite float. No factors takes tenants in turn, each
+    first in, first out. A plain class, since a Struct cannot take its factors as arguments; it
+    never changes after construction."""
 
     __slots__ = ("_factors",)
 
@@ -78,10 +79,12 @@ class Priority:
         if not view.waiting:
             return NoTicket()
         scored = [(factor.scores(view), weight) for factor, weight in self._factors]
+        tags = view.fairness.tags_of({w.ticket.tenant for w in view.waiting})
         return min(
             view.waiting,
             key=lambda w: (
                 -sum(weight * scores[w.ticket.id] for scores, weight in scored),
+                tags[w.ticket.tenant],
                 w.submitted_at,
                 w.ticket.id,
             ),

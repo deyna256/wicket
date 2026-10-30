@@ -19,6 +19,7 @@ from wicket.memory import MemoryBacklog, MemoryLedger, MemoryState
 from wicket.postgres import PostgresBacklog, PostgresLedger
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -29,6 +30,7 @@ from wicket.results import (
 )
 from wicket.store import Backlog, Ledger
 from wicket.tickets import Permit, Ticket, Trait
+from wicket.view import Grant
 
 EPOCH = datetime(2026, 1, 1, tzinfo=UTC)
 LEASE = timedelta(seconds=30)
@@ -123,7 +125,7 @@ async def granted(store: Pair, ticket_id: str, pool: str = "p", lease: timedelta
     view = await store.ledger.view(pool)
     chosen = next(w for w in view.waiting if w.ticket.id == ticket_id)
     permit = await store.ledger.grant(
-        pool, chosen, version=view.version, lease=lease, fairness=view.fairness.after(chosen)
+        pool, chosen, version=view.version, lease=lease, fairness=view.fairness.after(chosen, ())
     )
     assert isinstance(permit, Permit)
     return permit
@@ -131,7 +133,7 @@ async def granted(store: Pair, ticket_id: str, pool: str = "p", lease: timedelta
 
 async def test_a_pool_nobody_used_is_empty_at_version_zero(store: Pair):
     view = await store.ledger.view("never")
-    assert (view.waiting, view.leased, view.grant_times, view.version, view.fairness) == (
+    assert (view.waiting, view.leased, view.grants, view.version, view.fairness) == (
         (),
         (),
         (),
@@ -182,14 +184,14 @@ async def test_a_stale_view_cannot_grant_a_replacement(
         stale.waiting[0],
         version=stale.version,
         lease=LEASE,
-        fairness=stale.fairness.after(stale.waiting[0]),
+        fairness=stale.fairness.after(stale.waiting[0], ()),
     )
 
     assert answer == Missing()
     assert await store.ledger.view("p") == before
     permit = await granted(store, "1")
     assert permit.waiting.ticket == replacement
-    assert (await store.ledger.view("p")).fairness == before.fairness.after(before.waiting[0])
+    assert (await store.ledger.view("p")).fairness == before.fairness.after(before.waiting[0], ())
 
 
 async def test_a_submission_from_another_pool_cannot_grant_an_equal_id(store: Pair):
@@ -202,7 +204,7 @@ async def test_a_submission_from_another_pool_cannot_grant_an_equal_id(store: Pa
             a.waiting[0],
             version=b.version,
             lease=LEASE,
-            fairness=b.fairness.after(a.waiting[0]),
+            fairness=b.fairness.after(a.waiting[0], ()),
         )
         == Missing()
     )
@@ -247,8 +249,8 @@ async def test_a_grant_leases_the_ticket_and_writes_its_time_fairness_and_versio
     view = await store.ledger.view("p")
     assert (permit.pool, permit.waiting.ticket.id, permit.attempt, permit.token) == ("p", "1", 1, 1)
     assert view.waiting == () and view.leased == (permit,)
-    assert view.grant_times == (permit.granted_at,) and view.version == 1
-    assert view.fairness == Fairness().after(permit.waiting)
+    assert view.grants == (Grant(permit.granted_at, ""),) and view.version == 1
+    assert view.fairness == Fairness().after(permit.waiting, ())
 
 
 async def test_a_grant_at_a_stale_version_is_a_conflict(store: Pair):
@@ -327,7 +329,11 @@ async def test_a_renewal_invalidates_a_view_without_changing_the_permit_or_grant
     chosen = stale.waiting[0]
     assert (
         await store.ledger.grant(
-            "p", chosen, version=stale.version, lease=LEASE, fairness=stale.fairness.after(chosen)
+            "p",
+            chosen,
+            version=stale.version,
+            lease=LEASE,
+            fairness=stale.fairness.after(chosen, ()),
         )
         == Conflict()
     )
@@ -440,6 +446,169 @@ async def test_the_view_reports_the_retention_and_the_grants_within_it(store: Pa
     second = await granted(store, "2")
     view = await store.ledger.view("p")
     assert view.retention == RETENTION
-    assert view.grant_times == (first.granted_at, second.granted_at)
+    assert view.grants == (Grant(first.granted_at, ""), Grant(second.granted_at, ""))
     await store.elapse(timedelta(minutes=31))
-    assert (await store.ledger.view("p")).grant_times == (second.granted_at,)
+    assert (await store.ledger.view("p")).grants == (Grant(second.granted_at, ""),)
+
+
+async def test_a_ticket_keeps_its_lane_and_its_grant_records_it(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    await store.backlog.submit("p", Ticket("1", "bob", lane="generation"))  # known id: no change
+    assert [w.ticket for w in (await store.ledger.view("p")).waiting] == [
+        Ticket("1", "ann", lane="mentor")
+    ]
+    permit = await granted(store, "1")
+    assert permit.waiting.ticket.lane == "mentor"
+    assert (await store.ledger.view("p")).grants == (Grant(permit.granted_at, "mentor"),)
+
+
+async def test_a_presence_lasts_its_time_is_never_shortened_and_keeps_the_version(store: Pair):
+    ten = timedelta(seconds=10)
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
+    view = await store.ledger.view("p")
+    assert len(view.present) == 1
+    first = view.present[0]
+    assert (first.lane, first.until, view.version) == ("mentor", EPOCH + ten, 0)
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=2))
+    renewed = (await store.ledger.view("p")).present[0]
+    assert (renewed.lane, renewed.until) == ("mentor", EPOCH + ten)
+    assert renewed.token != first.token
+    await store.elapse(ten)
+    assert (await store.ledger.view("p")).present == ()
+
+
+async def test_an_attend_from_before_a_grant_cannot_refresh_a_presence(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    stale = await store.ledger.view("p")
+    await store.ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=10))
+    presence = (await store.ledger.view("p")).present[0]
+    await granted(store, "1")
+    assert (
+        await store.ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=20))
+        == Conflict()
+    )
+    view = await store.ledger.view("p")
+    assert view.present == (presence,)
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=20))
+        == Attended()
+    )
+    assert (await store.ledger.view("p")).present[0].token != presence.token
+
+
+async def test_an_attend_is_not_invalidated_by_a_grant_in_another_lane(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="generation"))
+    view = await store.ledger.view("p")
+    await granted(store, "1")
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=10))
+        == Attended()
+    )
+    assert (await store.ledger.view("p")).present[0].lane == "mentor"
+
+
+async def test_an_attend_from_before_a_renewal_cannot_refresh_a_presence(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    permit = await granted(store, "1")
+    stale = await store.ledger.view("p")
+    assert await store.ledger.renew(permit, lease=LEASE) == Renewed()
+    assert (
+        await store.ledger.attend("p", "mentor", version=stale.version, ttl=timedelta(seconds=10))
+        == Conflict()
+    )
+    assert (await store.ledger.view("p")).present == ()
+
+
+async def test_an_attend_rejects_a_version_the_pool_has_not_reached(store: Pair):
+    assert (
+        await store.ledger.attend("p", "mentor", version=1, ttl=timedelta(seconds=10)) == Conflict()
+    )
+    assert (await store.ledger.view("p")).present == ()
+
+
+async def test_a_grant_or_renewal_cannot_change_a_different_lanes_marker(store: Pair):
+    await store.backlog.submit("p", Ticket("1", "ann", lane="mentor"))
+    view = await store.ledger.view("p")
+    waiting = view.waiting[0]
+    wrong_ticket = msgspec.structs.replace(waiting.ticket, lane="generation")
+    wrong_waiting = msgspec.structs.replace(waiting, ticket=wrong_ticket)
+    permit = await store.ledger.grant(
+        "p", wrong_waiting, version=view.version, lease=LEASE, fairness=view.fairness
+    )
+    assert isinstance(permit, Permit)
+    assert permit.waiting.ticket.lane == "mentor"
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=10))
+        == Conflict()
+    )
+    assert (
+        await store.ledger.attend(
+            "p", "generation", version=view.version, ttl=timedelta(seconds=10)
+        )
+        == Attended()
+    )
+    view = await store.ledger.view("p")  # before the renewal
+    wrong_permit = msgspec.structs.replace(permit, waiting=wrong_waiting)
+    assert await store.ledger.renew(wrong_permit, lease=LEASE) == Renewed()
+    assert (
+        await store.ledger.attend("p", "mentor", version=view.version, ttl=timedelta(seconds=10))
+        == Conflict()
+    )
+    assert (
+        await store.ledger.attend(
+            "p", "generation", version=view.version, ttl=timedelta(seconds=10)
+        )
+        == Attended()
+    )
+
+
+@pytest.mark.parametrize("lane", ["", "a,b", 'a"b', "дорога"])
+async def test_a_lanes_name_is_a_single_marker_key(store: Pair, lane: str):
+    await store.backlog.submit("p", Ticket("1", "ann", lane=lane))
+    stale = await store.ledger.view("p")
+    await granted(store, "1")
+    assert await store.ledger.attend("p", lane, version=stale.version, ttl=LEASE) == Conflict()
+    assert await store.ledger.attend("p", "another", version=stale.version, ttl=LEASE) == Attended()
+
+
+async def test_a_presence_is_extended_from_each_attend(store: Pair):
+    ten = timedelta(seconds=10)
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
+    await store.elapse(timedelta(seconds=3))
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
+    assert (await store.ledger.view("p")).present[0].until == EPOCH + timedelta(seconds=3) + ten
+    await store.elapse(timedelta(seconds=3))
+    await store.ledger.attend("p", "mentor", version=0, ttl=ten)
+    six = timedelta(seconds=6)
+    assert (await store.ledger.view("p")).present[0].until == EPOCH + six + ten
+
+
+async def test_a_stale_leave_cannot_remove_a_renewed_or_recreated_presence(store: Pair):
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=10))
+    stale = (await store.ledger.view("p")).present[0]
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=1))
+    current = (await store.ledger.view("p")).present[0]
+    assert current.until == stale.until and current.token != stale.token
+    await store.ledger.leave("p", stale)
+    assert (await store.ledger.view("p")).present == (current,)
+    await store.ledger.leave("p", current)
+    assert (await store.ledger.view("p")).present == ()
+    await store.ledger.attend("p", "mentor", version=0, ttl=timedelta(seconds=10))
+    recreated = (await store.ledger.view("p")).present[0]
+    assert recreated.token != stale.token
+    await store.ledger.leave("p", stale)
+    assert (await store.ledger.view("p")).present == (recreated,)
+
+
+async def test_leave_removes_a_presence_of_its_own_pool_only(store: Pair):
+    ten = timedelta(seconds=10)
+    for pool in "pq":
+        await store.ledger.attend(pool, "mentor", version=0, ttl=ten)
+    await store.ledger.attend("p", "generation", version=0, ttl=ten)
+    generation, mentor = (await store.ledger.view("p")).present
+    other = (await store.ledger.view("q")).present[0]
+    await store.ledger.leave("p", other)  # another pool's token cannot remove p's mentor
+    await store.ledger.leave("p", mentor)
+    await store.ledger.leave("p", mentor)  # leaving twice changes nothing
+    assert (await store.ledger.view("p")).present == (generation,)
+    assert (await store.ledger.view("q")).present == (other,)

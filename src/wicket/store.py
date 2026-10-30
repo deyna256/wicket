@@ -8,6 +8,7 @@ from typing import Protocol
 from wicket.fairness import Fairness
 from wicket.results import (
     AlreadyLeased,
+    Attended,
     Conflict,
     Gone,
     LeaseLost,
@@ -17,7 +18,7 @@ from wicket.results import (
     Withdrawn,
 )
 from wicket.tickets import Permit, Ticket, Version, Waiting
-from wicket.view import PoolView
+from wicket.view import PoolView, Presence
 
 
 class Backlog(Protocol):
@@ -48,3 +49,16 @@ class Ledger(Protocol):
         ...
 
     async def release(self, permit: Permit) -> Released | LeaseLost: ...
+
+    async def attend(
+        self, pool: str, lane: str, *, version: Version, ttl: timedelta
+    ) -> Attended | Conflict:
+        """Pass a version from a view of this pool. If it is not in the future and the lane has
+        not had a grant or renewal since it, make the lane present until at least now + ttl with a
+        new token. Otherwise return Conflict without changing the presence. Another lane may have
+        changed; a presence never changes the pool version."""
+        ...
+
+    async def leave(self, pool: str, presence: Presence) -> None:
+        """Remove this presence only if its token still matches; never change the pool's version."""
+        ...
